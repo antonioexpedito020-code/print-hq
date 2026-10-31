@@ -1,5 +1,5 @@
 """
-Print HQ v3.0
+Print HQ v4.0
   Prints com editor embutido (setas, formas, texto, censura, marca-texto, numeração, OCR, fixar na tela)
   Gravação leve (FFmpeg) de monitor, janela ou área + replay dos últimos segundos
   Ferramentas: reduzir p/ Discord, cortar, GIF  |  Histórico  |  Ícone na bandeja  |  Atalhos editáveis
@@ -8,6 +8,7 @@ Instalação (uma vez):
     py -m pip install mss pillow keyboard pywin32 soundcard numpy pystray
 """
 import contextlib
+import hashlib
 import copy
 import ctypes
 import ctypes.wintypes
@@ -29,6 +30,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 import mss
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageTk
@@ -56,7 +58,7 @@ try:
 except Exception:
     winreg = None
 
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 UPDATE_URL = "https://raw.githubusercontent.com/antonioexpedito020-code/print-hq/main/print_hq.pyw"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 CONFIG = Path.home() / ".print_hq.json"
@@ -67,15 +69,25 @@ FROZEN = getattr(sys, "frozen", False)
 BG, PANEL, FG, MUTED = "#1e1f22", "#2b2d31", "#e6e6e6", "#9aa0a6"
 ACCENT, RED = "#4f8cff", "#e5484d"
 
-HK_NAMES = {"region": "Capturar área", "window": "Capturar janela", "full": "Capturar tela inteira",
+HK_NAMES = {"region": "Capturar área", "region_quick": "Capturar área e copiar direto",
+            "window": "Capturar janela", "full": "Capturar tela inteira",
             "rec": "Iniciar / parar gravação", "pause": "Pausar / retomar gravação",
             "replay_save": "Salvar replay agora", "replay_toggle": "Ligar / desligar replay"}
-HK_DEFAULT = {"region": "ctrl+alt+a", "window": "ctrl+alt+w", "full": "ctrl+alt+s", "rec": "ctrl+alt+r",
+HK_DEFAULT = {"region": "ctrl+alt+a", "region_quick": "ctrl+alt+q", "window": "ctrl+alt+w", "full": "ctrl+alt+s", "rec": "ctrl+alt+r",
               "pause": "ctrl+alt+p", "replay_save": "ctrl+alt+d", "replay_toggle": "ctrl+alt+y"}
 
 RES_MAP = {"Original": 0, "1440p": 1440, "1080p": 1080, "720p": 720, "480p": 480}
-QUALITY = ["Leve (arquivo pequeno)", "Equilibrada", "Alta qualidade"]
-QV = {"libx264": [30, 25, 21], "h264_nvenc": [33, 28, 23], "h264_amf": [33, 28, 23], "h264_qsv": [33, 28, 23]}
+QUALITY = ["Leve (arquivo pequeno)", "Equilibrada", "Alta qualidade", "Máxima"]
+QV = {"libx264": [29, 24, 20, 17], "h264_nvenc": [31, 26, 22, 18], "h264_amf": [31, 26, 22, 18],
+      "h264_qsv": [31, 26, 22, 18]}
+PROFILES = {  # (resolução, fps, qualidade)
+    "Equilibrado - 1080p 60 fps": ("1080p", "60", QUALITY[1]),
+    "Jogo - 1080p 60 fps, alta qualidade": ("1080p", "60", QUALITY[2]),
+    "Tutorial - 1080p 30 fps, alta qualidade": ("1080p", "30", QUALITY[2]),
+    "Discord leve - 720p 30 fps": ("720p", "30", QUALITY[0]),
+    "Baixo consumo - 720p 30 fps": ("720p", "30", QUALITY[1]),
+    "Máxima - tela original 60 fps": ("Original", "60", QUALITY[3]),
+}
 ENC_LABEL = {"h264_nvenc": "placa NVIDIA (NVENC) - leve para o PC", "h264_amf": "placa AMD (AMF) - leve para o PC",
              "h264_qsv": "Intel (QuickSync) - leve para o PC", "libx264": "processador (x264)"}
 WIN_LABEL, AREA_LABEL = "Uma janela específica", "Uma área da tela"
@@ -483,7 +495,7 @@ def detect_encoder(ffmpeg):
 def enc_args(enc, qi, fps):
     q, g = QV[enc][qi], str(fps * 2)
     if enc == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", str(q), "-b:v", "0",
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(q), "-b:v", "0",
                 "-profile:v", "high", "-g", g]
     if enc == "h264_amf":
         return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", str(q),
@@ -595,6 +607,7 @@ class AudioFeeder(threading.Thread):
                 ch = max(1, min(2, getattr(dev, "channels", 2)))
                 recs.append(stack.enter_context(
                     dev.recorder(samplerate=self.RATE, channels=ch, blocksize=self.BLOCK * 4)))
+            skip = int(-self.offset_ms / 20) if self.offset_ms < 0 else 0
             while not self.stop_ev.is_set():
                 mix = None
                 for r in recs:
@@ -604,6 +617,9 @@ class AudioFeeder(threading.Thread):
                     if d.shape[1] == 1:
                         d = np.repeat(d, 2, axis=1)
                     mix = d if mix is None else mix + d
+                if skip > 0:
+                    skip -= 1
+                    continue
                 self.stdin.write(np.clip(mix, -1, 1).astype("<f4").tobytes())
                 self.stdin.flush()
 
@@ -892,10 +908,14 @@ def setup_style(root):
     st.configure("TCheckbutton", background=BG, foreground=FG)
     st.map("TCheckbutton", background=[("active", BG)])
     st.configure("TCombobox", arrowsize=14, padding=4)
-    st.map("TCombobox", fieldbackground=[("readonly", PANEL), ("disabled", "#232427")],
+    st.map("TCombobox", fieldbackground=[("readonly", "#222428"), ("disabled", "#232427")],
            foreground=[("readonly", FG), ("disabled", "#666")],
-           selectbackground=[("readonly", PANEL)], selectforeground=[("readonly", FG)])
-    st.configure("TEntry", fieldbackground=PANEL, foreground=FG, insertcolor=FG, padding=4)
+           selectbackground=[("readonly", "#222428")], selectforeground=[("readonly", FG)])
+    st.configure("TEntry", fieldbackground="#222428", foreground=FG, insertcolor=FG, padding=4)
+    st.configure("TSpinbox", fieldbackground="#222428", foreground=FG, insertcolor=FG, arrowsize=12, padding=3)
+    st.configure("Vertical.TScrollbar", background="#383b42", troughcolor=BG, arrowcolor=FG, bordercolor=BG,
+                 lightcolor="#383b42", darkcolor="#383b42")
+    st.map("Vertical.TScrollbar", background=[("active", "#454951")])
     st.configure("TSpinbox", arrowsize=12, padding=3)
     st.configure("TNotebook", background=BG, borderwidth=0)
     st.configure("TNotebook.Tab", background=BG, foreground=MUTED, padding=(12, 8), borderwidth=0)
@@ -1019,9 +1039,10 @@ COLORS = ["#ff3b30", "#ffcc00", "#34c759", "#0a84ff", "#000000", "#ffffff"]
 class SnapOverlay:
     """Tela congelada. mode: region | full | window | pick (só escolhe a área, p/ gravação)."""
 
-    def __init__(self, app, img, left, top, prev, mode="region", on_pick=None):
+    def __init__(self, app, img, left, top, prev, mode="region", on_pick=None, quick=False):
         self.app, self.img, self.prev, self.mode, self.on_pick = app, img, prev, mode, on_pick
         self.left, self.top = left, top
+        self.editor = (not quick) and app.use_editor.get()
         self.W, self.H = img.size
         self.phase, self.box = "select", None
         self.shapes, self.undo = [], []
@@ -1049,6 +1070,7 @@ class SnapOverlay:
         w.bind("<Key>", self.on_key)
         w.bind("<Escape>", self.cancel)
         w.bind("<Return>", lambda e: None if self.typing() else self.finish(True, False))
+        w.bind("<Control-c>", lambda e: None if self.typing() else self.finish(True, False))
         w.bind("<Control-s>", lambda e: None if self.typing() else self.finish(False, True))
         w.bind("<Control-z>", lambda e: None if self.typing() else self.do_undo())
         w.bind("<Delete>", lambda e: None if self.typing() else self.delete_sel())
@@ -1125,7 +1147,7 @@ class SnapOverlay:
             self.close()
             self.app.restore(self.prev)
             self.on_pick(absbox)
-        elif self.app.use_editor.get():
+        elif self.editor:
             self.enter_edit(box)
         else:
             self.close()
@@ -1190,7 +1212,7 @@ class SnapOverlay:
         tk.Frame(row2, bg=PANEL).pack(side="left", expand=True, fill="x")
         btn("Cancelar", self.cancel, "Esc", "#5a2a2c")
         btn("Salvar", lambda: self.finish(False, True), "Ctrl+S")
-        btn("Copiar", lambda: self.finish(True, False), "Enter", ACCENT, True)
+        btn("Copiar", lambda: self.finish(True, False), "Ctrl+C ou Enter", ACCENT, True)
 
         bar.update_idletasks()
         bw, bh = bar.winfo_reqwidth(), bar.winfo_reqheight()
@@ -1481,6 +1503,225 @@ class SnapOverlay:
             self.win.destroy()
 
 
+# ----------------------------------------------------------- widgets modernos
+UI = 1.0  # fator de escala da tela (definido ao abrir a janela)
+SIDE, BTN, BTN_H, FIELD = "#17181a", "#383b42", "#454951", "#222428"
+
+
+def px(n):
+    return max(1, int(round(n * UI)))
+
+
+def rrect(c, x0, y0, x1, y1, r, **kw):
+    r = max(1, min(int(r), int((x1 - x0) // 2), int((y1 - y0) // 2)))
+    pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1, x1 - r, y1,
+           x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+    return c.create_polygon(pts, smooth=True, **kw)
+
+
+class RoundBtn(tk.Canvas):
+    """Botão arredondado. kind: normal | accent | danger | ghost."""
+    KINDS = {"normal": (BTN, BTN_H, FG), "accent": (ACCENT, "#6b9bff", "white"),
+             "danger": (RED, "#ff6166", "white"), "ghost": (None, "#33363c", FG)}
+
+    def __init__(self, parent, text, command=None, kind="normal", bg=None, font=("Segoe UI", 10, "bold"),
+                 padx=16, pady=8, image=None):
+        self.text, self.command, self.kind, self.st, self.image = text, command, kind, "normal", image
+        self.fnt = tkfont.Font(font=font)
+        self.padx, self.pady, self.hover = px(padx), px(pady), False
+        try:
+            bgc = bg or parent["bg"]
+        except Exception:
+            bgc = BG
+        w, h = self._measure()
+        super().__init__(parent, width=w, height=h, bg=bgc, highlightthickness=0, bd=0, cursor="hand2")
+        self.bind("<Configure>", lambda e: self.draw())
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<ButtonRelease-1>", self._click)
+        self.draw()
+
+    def _measure(self):
+        lines = self.text.split("\n")
+        w = self.fnt.measure(max(lines, key=len)) + self.padx * 2
+        h = self.fnt.metrics("linespace") * len(lines) + self.pady * 2
+        if self.image is not None:
+            w = max(w, self.image.width() + self.padx * 2)
+            h += self.image.height() + px(4)
+        return w, h
+
+    def _set_hover(self, v):
+        self.hover = v
+        self.draw()
+
+    def _click(self, e):
+        if self.st == "disabled" or not self.command:
+            return
+        if 0 <= e.x <= self.winfo_width() and 0 <= e.y <= self.winfo_height():
+            self.command()
+
+    def draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 5:
+            w, h = int(float(self.cget("width"))), int(float(self.cget("height")))
+        fill, hov, fg = self.KINDS[self.kind]
+        if self.st == "disabled":
+            fill, fg = ("#2a2c30" if fill else None), "#6b6f76"
+        elif self.hover:
+            fill = hov
+        if fill:
+            rrect(self, 1, 1, w - 1, h - 1, px(10), fill=fill, outline="")
+        ty = h / 2
+        if self.image is not None:
+            ih = self.image.height()
+            total = ih + px(4) + self.fnt.metrics("linespace") * (self.text.count("\n") + 1)
+            top = (h - total) / 2
+            self.create_image(w / 2, top + ih / 2, image=self.image)
+            ty = top + ih + px(4) + (total - ih - px(4)) / 2
+        self.create_text(w / 2, ty, text=self.text, fill=fg, font=self.fnt, justify="center")
+
+    def configure(self, cnf=None, **kw):
+        changed = False
+        for k, attr in (("text", "text"), ("command", "command"), ("kind", "kind"), ("state", "st")):
+            if k in kw:
+                setattr(self, attr, kw.pop(k))
+                changed = True
+        if "text" in (cnf or {}) or changed:
+            w, _ = self._measure()
+            if w > int(float(self.cget("width"))):
+                super().configure(width=w)
+        if kw or cnf:
+            super().configure(cnf, **kw)
+        self.draw()
+    config = configure
+
+
+class Switch(tk.Canvas):
+    """Interruptor ligado/desligado ligado a uma BooleanVar."""
+
+    def __init__(self, parent, variable, command=None, bg=PANEL):
+        super().__init__(parent, width=px(46), height=px(24), bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.var, self.command = variable, command
+        self.bind("<Button-1>", self.toggle)
+        variable.trace_add("write", lambda *a: self.draw())
+        self.draw()
+
+    def toggle(self, e=None):
+        self.var.set(not self.var.get())
+        if self.command:
+            self.command()
+
+    def draw(self):
+        self.delete("all")
+        w, h = int(float(self.cget("width"))), int(float(self.cget("height")))
+        on = bool(self.var.get())
+        rrect(self, 1, 1, w - 1, h - 1, h // 2, fill=ACCENT if on else "#4a4e56", outline="")
+        r = h // 2 - 3
+        cx = w - h // 2 if on else h // 2
+        self.create_oval(cx - r, h // 2 - r, cx + r, h // 2 + r, fill="white", outline="")
+
+
+class Segmented(tk.Frame):
+    """Abas em forma de pílulas."""
+
+    def __init__(self, parent, options, command, bg=BG):
+        super().__init__(parent, bg=bg)
+        self.command, self.labels, self.base = command, {}, bg
+        for key, text in options:
+            lab = tk.Label(self, text=text, bg=bg, fg=MUTED, font=("Segoe UI", 10, "bold"),
+                           padx=px(12), pady=px(6), cursor="hand2")
+            lab.pack(side="left", padx=(0, px(2)))
+            lab.bind("<Button-1>", lambda e, k=key: self.select(k))
+            self.labels[key] = lab
+
+    def select(self, key):
+        for k, lab in self.labels.items():
+            lab.configure(bg=PANEL if k == key else self.base, fg="white" if k == key else MUTED)
+        self.command(key)
+
+
+def nav_icon(name, color, size=22):
+    S = size * 6
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    lw = max(3, S // 12)
+    if name == "home":
+        d.line([(.10 * S, .50 * S), (.50 * S, .14 * S), (.90 * S, .50 * S)], fill=color, width=lw, joint="curve")
+        d.rectangle((.2 * S, .46 * S, .8 * S, .88 * S), outline=color, width=lw)
+        d.line([(.5 * S, .88 * S), (.5 * S, .62 * S)], fill=color, width=lw)
+    elif name == "tools":
+        for y, kx in ((.26, .68), (.5, .32), (.74, .62)):
+            d.line([(.12 * S, y * S), (.88 * S, y * S)], fill=color, width=lw)
+            r = .1 * S
+            d.ellipse((kx * S - r, y * S - r, kx * S + r, y * S + r), fill=color)
+    elif name == "hist":
+        d.ellipse((.12 * S, .12 * S, .88 * S, .88 * S), outline=color, width=lw)
+        d.line([(.5 * S, .5 * S), (.5 * S, .26 * S)], fill=color, width=lw)
+        d.line([(.5 * S, .5 * S), (.68 * S, .58 * S)], fill=color, width=lw)
+    else:
+        for k in range(8):
+            a = math.pi / 4 * k
+            c, s = math.cos(a), math.sin(a)
+            d.line([((.5 + .30 * c) * S, (.5 + .30 * s) * S), ((.5 + .44 * c) * S, (.5 + .44 * s) * S)],
+                   fill=color, width=int(lw * 1.6))
+        d.ellipse((.22 * S, .22 * S, .78 * S, .78 * S), outline=color, width=lw)
+        d.ellipse((.40 * S, .40 * S, .60 * S, .60 * S), outline=color, width=lw)
+    return ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
+
+
+def cap_icon(name, size=30, color="#ffffff"):
+    S = size * 6
+    im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    lw = max(3, S // 11)
+    if name in ("region", "quick"):
+        L, m = .28 * S, .12 * S
+        for x, y, dx, dy in ((m, m, 1, 1), (S - m, m, -1, 1), (m, S - m, 1, -1), (S - m, S - m, -1, -1)):
+            d.line([(x + dx * L, y), (x, y), (x, y + dy * L)], fill=color, width=lw, joint="curve")
+        if name == "quick":
+            d.ellipse((.4 * S, .4 * S, .6 * S, .6 * S), fill=color)
+    elif name == "window":
+        d.rectangle((.1 * S, .18 * S, .9 * S, .82 * S), outline=color, width=lw)
+        d.line([(.1 * S, .36 * S), (.9 * S, .36 * S)], fill=color, width=lw)
+    else:
+        d.rectangle((.08 * S, .14 * S, .92 * S, .68 * S), outline=color, width=lw)
+        d.line([(.5 * S, .68 * S), (.5 * S, .84 * S)], fill=color, width=lw)
+        d.line([(.3 * S, .86 * S), (.7 * S, .86 * S)], fill=color, width=lw)
+    return ImageTk.PhotoImage(im.resize((size, size), Image.LANCZOS))
+
+
+IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def make_thumb(path, ff, size):
+    """Miniatura para o histórico (imagem direta; vídeo via um quadro extraído pelo FFmpeg)."""
+    path = Path(path)
+    try:
+        if path.suffix.lower() in IMG_EXT:
+            im = Image.open(path).convert("RGB")
+        else:
+            if not ff:
+                return None
+            th = APP_DIR / "thumbs"
+            th.mkdir(parents=True, exist_ok=True)
+            out = th / f"{hashlib.md5(str(path).encode()).hexdigest()[:12]}_{int(path.stat().st_mtime)}.png"
+            if not out.exists():
+                for ss in ("1", "0"):
+                    subprocess.run([ff, "-y", "-loglevel", "error", "-ss", ss, "-i", str(path), "-frames:v", "1",
+                                    "-vf", "scale=240:-2", str(out)], capture_output=True, timeout=25,
+                                   creationflags=NOWIN)
+                    if out.exists():
+                        break
+            im = Image.open(out).convert("RGB")
+        im.thumbnail(size)
+        bgimg = Image.new("RGB", size, "#111111")
+        bgimg.paste(im, ((size[0] - im.width) // 2, (size[1] - im.height) // 2))
+        return bgimg
+    except Exception:
+        return None
+
+
 class Tray:
     def __init__(self, app):
         import pystray
@@ -1508,68 +1749,119 @@ class Tray:
 
 
 # ======================================================================= app
+SNAP_MODES = ["Abrir o editor (anotar antes de copiar)", "Copiar direto ao soltar o mouse"]
+
+
 class App:
     def __init__(self):
+        global UI
         cfg = self.cfg = load_cfg()
         self.root = tk.Tk()
         self.root.title("Print HQ")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
+        self.root.report_callback_exception = self.on_ui_error
+        UI = max(1.0, self.root.winfo_fpixels("1i") / 96)
         setup_style(self.root)
         with contextlib.suppress(Exception):
             self.app_icon = ImageTk.PhotoImage(make_icon(64))
             self.root.iconphoto(True, self.app_icon)
 
         self.ui_queue = queue.Queue()
-        self.busy, self.job_running = False, False
+        self.busy, self.job_running, self._applying = False, False, False
         self.rec = Recorder(self)
         self.ffmpeg, self.encoder, self.minibar, self.area = None, None, None, None
-        self.ticking, self.tray = False, None
+        self.ticking, self.tray, self.hist_imgs = False, None, {}
         self.hotkeys = {**HK_DEFAULT, **cfg.get("hotkeys", {})}
+        self.hk_vars = {k: tk.StringVar(value=v) for k, v in self.hotkeys.items()}
         self.history = [h for h in cfg.get("history", []) if Path(h[0]).exists()][:60]
 
         V = lambda key, default: tk.StringVar(value=cfg.get(key, default))
         self.folder = V("folder", str(Path.home() / "Pictures" / "Prints"))
         self.fmt = V("fmt", "PNG")
         self.use_editor = tk.BooleanVar(value=cfg.get("editor", True))
+        self.snap_mode = tk.StringVar(value=SNAP_MODES[0 if self.use_editor.get() else 1])
         self.delay = tk.IntVar(value=0)
         self.vfolder = V("vfolder", str(Path.home() / "Videos" / "Gravações"))
         self.rec_target = V("target", "")
         self.rec_window = tk.StringVar(value="")
         self.rec_res = V("res", "1080p")
         self.rec_fps = V("fps", "60")
-        self.rec_quality = V("quality", QUALITY[0])
+        self.rec_quality = V("quality", QUALITY[1])
+        if cfg.get("v") != 4:  # versões antigas gravavam em "Leve": sobe para "Equilibrada"
+            self.rec_quality.set(QUALITY[1])
         self.rec_mic = V("mic", "Nenhum")
         self.rec_sys = V("sys", "")
+        self.profile = tk.StringVar(value="Personalizado")
+        self.sync_profile()
+        self.audio_offset = tk.IntVar(value=int(cfg.get("audio_offset_ms", 0)))
         self.replay_len = V("replay_len", "30 s")
+        self.replay_var = tk.BooleanVar(value=False)
         self.close_tray = tk.BooleanVar(value=cfg.get("close_tray", True))
         self.autostart = tk.BooleanVar(value=get_autostart())
+        self.precise = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Pronto.")
         self.time_var = tk.StringVar(value="00:00:00")
         self.size_var = tk.StringVar(value="0.0 MB")
         self.enc_var = tk.StringVar(value="")
         self.area_var = tk.StringVar(value="Nenhuma área escolhida.")
-        for v in (self.folder, self.fmt, self.use_editor, self.vfolder, self.rec_target, self.rec_res,
-                  self.rec_fps, self.rec_quality, self.rec_mic, self.rec_sys, self.replay_len, self.close_tray):
+        self.tool_file = tk.StringVar()
+        self.t_start, self.t_end = tk.StringVar(), tk.StringVar()
+        self.dc_limit = tk.StringVar(value="10 MB")
+        self.gif_w, self.gif_fps = tk.StringVar(value="480"), tk.StringVar(value="15")
+
+        self.mon_list = list_monitors()
+        self.mon_map = {f"Monitor {i + 1}  ({m['width']}x{m['height']})": (i, m) for i, m in enumerate(self.mon_list)}
+        self.targets = list(self.mon_map) + [WIN_LABEL, AREA_LABEL]
+        if self.rec_target.get() not in self.targets:
+            self.rec_target.set(self.targets[0])
+        mics, spks, default, err = list_audio()
+        self.audio_err, self.mics, self.spks = err, mics, spks
+        if self.rec_mic.get() not in ["Nenhum"] + mics:
+            self.rec_mic.set("Nenhum")
+        if self.rec_sys.get() not in ["Nenhum"] + spks:
+            self.rec_sys.set(default or "Nenhum")
+
+        for v in (self.folder, self.fmt, self.use_editor, self.vfolder, self.rec_target, self.rec_res, self.rec_fps,
+                  self.rec_quality, self.rec_mic, self.rec_sys, self.replay_len, self.close_tray, self.audio_offset):
             v.trace_add("write", lambda *a: self.save_cfg())
+        for v in (self.rec_res, self.rec_fps, self.rec_quality):
+            v.trace_add("write", self.mark_custom)
 
-        nb = self.nb = ttk.Notebook(self.root)
-        nb.pack(padx=10, pady=(10, 4), fill="both")
-        frames = [ttk.Frame(nb, padding=14) for _ in range(6)]
-        for fr, name in zip(frames, ("Print", "Gravar", "Replay", "Ferramentas", "Histórico", "Atalhos")):
-            nb.add(fr, text=name)
-        self.build_print_tab(frames[0])
-        self.build_rec_tab(frames[1])
-        self.build_replay_tab(frames[2])
-        self.build_tools_tab(frames[3])
-        self.build_history_tab(frames[4])
-        self.build_hotkeys_tab(frames[5])
+        self.cap_icons = {n: cap_icon(n) for n in ("region", "window", "full", "quick")}
+        self.nav_icons = {n: (nav_icon(n, MUTED), nav_icon(n, "#ffffff"))
+                          for n in ("home", "tools", "hist", "cfg")}
 
-        foot = ttk.Frame(self.root, padding=(14, 0, 14, 10))
-        foot.pack(fill="x")
-        ttk.Label(foot, textvariable=self.status, style="Muted.TLabel", wraplength=440).pack(anchor="w")
-        ttk.Button(foot, text=f"Verificar atualização (v{VERSION})", command=self.check_update
-                   ).pack(anchor="w", pady=(6, 0))
+        outer = tk.Frame(self.root, bg=BG)
+        outer.pack(fill="both", expand=True)
+        side = tk.Frame(outer, bg=SIDE)
+        side.pack(side="left", fill="y")
+        tk.Label(side, text="Print HQ", bg=SIDE, fg="white", font=("Segoe UI", 15, "bold")
+                 ).pack(padx=px(18), pady=(px(18), px(16)), anchor="w")
+        self.nav = {}
+        for key, label in (("home", "Início"), ("tools", "Ferramentas"), ("hist", "Histórico"),
+                           ("cfg", "Configurações")):
+            self.make_nav(side, key, label)
+        tk.Label(side, text=f"v{VERSION}", bg=SIDE, fg="#555", font=("Segoe UI", 8)
+                 ).pack(side="bottom", pady=px(10))
+
+        main = tk.Frame(outer, bg=BG)
+        main.pack(side="left", fill="both", expand=True, padx=px(18), pady=px(14))
+        host = tk.Frame(main, bg=BG)
+        host.pack(fill="both", expand=True)
+        host.grid_rowconfigure(0, weight=1)
+        host.grid_columnconfigure(0, weight=1)
+        self.pages = {k: tk.Frame(host, bg=BG) for k in ("home", "tools", "hist", "cfg")}
+        for pg in self.pages.values():
+            pg.grid(row=0, column=0, sticky="nsew")
+        tk.Label(main, textvariable=self.status, bg=BG, fg=MUTED, anchor="nw", justify="left", height=2,
+                 wraplength=px(560), font=("Segoe UI", 9)).pack(fill="x", pady=(px(8), 0))
+
+        self.build_home(self.pages["home"])
+        self.build_tools(self.pages["tools"])
+        self.build_history(self.pages["hist"])
+        self.build_settings(self.pages["cfg"])
+        self.show_page("home")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         try:
@@ -1583,87 +1875,127 @@ class App:
         self.root.after(50, self.pump)
         self.root.after(400, lambda: exclude_from_capture(self.root))
 
-    # ------------------------------------------------------------ abas
-    def build_print_tab(self, f):
-        f.columnconfigure((0, 1, 2), weight=1)
-        for col, (text, mode, style) in enumerate((("Capturar área", "region", "Accent.TButton"),
-                                                   ("Capturar janela", "window", "TButton"),
-                                                   ("Tela inteira", "full", "TButton"))):
-            ttk.Button(f, text=text, style=style, command=lambda m=mode: self.capture(m)
-                       ).grid(row=0, column=col, sticky="ew", padx=2, pady=4)
-        ttk.Checkbutton(f, text="Editar na hora (setas, formas, texto, censura...)", variable=self.use_editor
-                        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 4))
-        ttk.Label(f, text="Formato ao salvar", style="Muted.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Combobox(f, textvariable=self.fmt, state="readonly", values=["PNG", "JPEG (q100)", "WebP (lossless)"]
-                     ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=(0, 4))
-        ttk.Label(f, text="Atraso (segundos)", style="Muted.TLabel").grid(row=2, column=2, sticky="w", pady=(8, 0), padx=(4, 0))
-        ttk.Spinbox(f, from_=0, to=30, textvariable=self.delay, width=6).grid(row=3, column=2, sticky="ew", padx=(4, 0))
-        ttk.Label(f, text="Pasta dos prints", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        ttk.Button(f, text="Alterar…", command=lambda: self.pick_folder(self.folder)
-                   ).grid(row=5, column=0, sticky="ew", padx=(0, 4))
-        ttk.Label(f, textvariable=self.folder, style="Muted.TLabel", wraplength=440
-                  ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
+    def on_ui_error(self, exc, val, tb):
+        import traceback
+        txt = "".join(traceback.format_exception(exc, val, tb))
+        with contextlib.suppress(Exception):
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            (APP_DIR / "error.log").write_text(txt, encoding="utf-8")
+        self.status.set(f"Erro: {val}")
 
-    def build_rec_tab(self, f):
-        f.columnconfigure((0, 1), weight=1)
-        self.mon_list = list_monitors()
-        self.mon_map = {}
-        for i, m in enumerate(self.mon_list):
-            self.mon_map[f"Monitor {i + 1}  ({m['width']}x{m['height']})"] = (i, m)
-        targets = list(self.mon_map) + [WIN_LABEL, AREA_LABEL]
-        if self.rec_target.get() not in targets:
-            self.rec_target.set(targets[0])
+    # ------------------------------------------------------------ navegação
+    def make_nav(self, side, key, label):
+        row = tk.Frame(side, bg=SIDE, cursor="hand2")
+        row.pack(fill="x", pady=1)
+        bar = tk.Frame(row, bg=SIDE, width=px(4))
+        bar.pack(side="left", fill="y")
+        ic = tk.Label(row, bg=SIDE, image=self.nav_icons[key][0])
+        ic.pack(side="left", padx=(px(14), px(8)), pady=px(10))
+        tx = tk.Label(row, text=label, bg=SIDE, fg=MUTED, font=("Segoe UI", 11), anchor="w", width=13)
+        tx.pack(side="left", padx=(0, px(14)))
+        for w in (row, bar, ic, tx):
+            w.bind("<Button-1>", lambda e, k=key: self.show_page(k))
+        self.nav[key] = (row, bar, ic, tx)
 
-        def combo(label, var, values, r, c, span=1, **kw):
-            ttk.Label(f, text=label, style="Muted.TLabel").grid(row=r, column=c, sticky="w", pady=(6, 0))
-            cb = ttk.Combobox(f, textvariable=var, values=values, state="readonly", **kw)
-            cb.grid(row=r + 1, column=c, columnspan=span, sticky="ew", padx=(0, 4) if c == 0 and span == 1 else 0)
-            return cb
+    def show_page(self, key):
+        self.pages[key].tkraise()
+        for k, (row, bar, ic, tx) in self.nav.items():
+            on = k == key
+            bgc = "#26282c" if on else SIDE
+            row.configure(bg=bgc)
+            ic.configure(bg=bgc, image=self.nav_icons[k][1 if on else 0])
+            tx.configure(bg=bgc, fg="white" if on else MUTED)
+            bar.configure(bg=ACCENT if on else bgc)
 
-        combo("O que gravar", self.rec_target, targets, 0, 0, span=2)
-        self.extra = ttk.Frame(f)
-        self.extra.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+    # ------------------------------------------------------------ helpers de interface
+    def lbl(self, parent, text, muted=True, bg=PANEL, size=None, bold=False, **kw):
+        return tk.Label(parent, text=text, bg=bg, fg=MUTED if muted else FG, anchor="w", justify="left",
+                        font=("Segoe UI", size or (9 if muted else 10), "bold" if bold else "normal"), **kw)
+
+    def cmb(self, parent, var, values, width=22, **kw):
+        return ttk.Combobox(parent, textvariable=var, values=values, state="readonly", width=width, **kw)
+
+    def card(self, parent, title=None, pady=(0, 0)):
+        outer = tk.Frame(parent, bg=PANEL)
+        outer.pack(fill="x", pady=pady)
+        inner = tk.Frame(outer, bg=PANEL)
+        inner.pack(fill="x", padx=px(14), pady=px(12))
+        if title:
+            tk.Label(inner, text=title, bg=PANEL, fg="white", font=("Segoe UI", 11, "bold"), anchor="w"
+                     ).pack(fill="x", pady=(0, px(6)))
+        body = tk.Frame(inner, bg=PANEL)
+        body.pack(fill="x")
+        return body
+
+    def heading(self, p, title, sub=None):
+        tk.Label(p, text=title, bg=BG, fg="white", font=("Segoe UI", 16, "bold"), anchor="w").pack(fill="x")
+        if sub:
+            tk.Label(p, text=sub, bg=BG, fg=MUTED, font=("Segoe UI", 9), anchor="w", justify="left",
+                     wraplength=px(540)).pack(fill="x", pady=(2, px(8)))
+
+    def form_row(self, parent, r, label, widget):
+        self.lbl(parent, label).grid(row=r, column=0, sticky="w", pady=px(5), padx=(0, px(14)))
+        widget.grid(row=r, column=1, sticky="w", pady=px(5))
+
+    # ------------------------------------------------------------ INÍCIO
+    def build_home(self, p):
+        self.heading(p, "O que você quer fazer?",
+                     "Os atalhos funcionam mesmo com esta janela fechada (o app fica na bandeja do Windows).")
+        row = tk.Frame(p, bg=BG)
+        row.pack(fill="x")
+        tiles = (("Área", "region", "accent", "region", "region"), ("Janela", "window", "normal", "window", "window"),
+                 ("Tela inteira", "full", "normal", "full", "full"),
+                 ("Área e copiar", "quick", "normal", "quick", "region_quick"))
+        for col, (label, mode, kind, icon, hk) in enumerate(tiles):
+            row.columnconfigure(col, weight=1, uniform="tile")
+            tile = tk.Frame(row, bg=PANEL)
+            tile.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else px(6), 0))
+            RoundBtn(tile, label, command=lambda m=mode: self.capture(m), kind=kind, bg=PANEL,
+                     image=self.cap_icons[icon], padx=6).pack(fill="x", padx=px(8), pady=(px(8), px(2)))
+            tk.Label(tile, textvariable=self.hk_vars[hk], bg=PANEL, fg=MUTED, font=("Consolas", 8)
+                     ).pack(pady=(0, px(6)))
+
+        card = self.card(p, "Gravação de vídeo", pady=(px(12), 0))
+        card.columnconfigure((0, 1), weight=1)
+        self.lbl(card, "O que gravar").grid(row=0, column=0, sticky="w")
+        self.lbl(card, "Perfil").grid(row=0, column=1, sticky="w", padx=(px(8), 0))
+        self.cmb(card, self.rec_target, self.targets, width=26).grid(row=1, column=0, sticky="ew")
+        pc = self.cmb(card, self.profile, list(PROFILES) + ["Personalizado"], width=26)
+        pc.grid(row=1, column=1, sticky="ew", padx=(px(8), 0))
+        pc.bind("<<ComboboxSelected>>", self.apply_profile)
+        self.extra = tk.Frame(card, bg=PANEL)
+        self.extra.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(px(6), 0))
         self.extra.columnconfigure(0, weight=1)
         self.win_cb = ttk.Combobox(self.extra, textvariable=self.rec_window, state="readonly",
                                    postcommand=self.refresh_windows)
         self.win_cb.grid(row=0, column=0, sticky="ew")
-        self.area_row = ttk.Frame(self.extra)
-        ttk.Button(self.area_row, text="Selecionar área…", command=self.pick_area).pack(side="left")
-        ttk.Label(self.area_row, textvariable=self.area_var, style="Muted.TLabel").pack(side="left", padx=8)
+        self.area_row = tk.Frame(self.extra, bg=PANEL)
+        RoundBtn(self.area_row, "Selecionar área…", command=self.pick_area, bg=PANEL, padx=12, pady=5,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Label(self.area_row, textvariable=self.area_var, bg=PANEL, fg=MUTED, font=("Segoe UI", 9)
+                 ).pack(side="left", padx=8)
         self.rec_target.trace_add("write", lambda *a: self.on_target_change())
-        combo("Resolução", self.rec_res, list(RES_MAP), 3, 0)
-        combo("FPS", self.rec_fps, ["24", "30", "60"], 3, 1)
-        combo("Qualidade / tamanho do arquivo", self.rec_quality, QUALITY, 5, 0, span=2)
-
-        mics, spks, default, err = list_audio()
-        self.audio_err = err
-        self.mic_cb = combo("Microfone", self.rec_mic, ["Nenhum"] + mics, 7, 0)
-        self.sys_cb = combo("Áudio do computador", self.rec_sys, ["Nenhum"] + spks, 7, 1)
-        if self.rec_mic.get() not in ["Nenhum"] + mics:
-            self.rec_mic.set("Nenhum")
-        if self.rec_sys.get() not in ["Nenhum"] + spks:
-            self.rec_sys.set(default or "Nenhum")
-        if err:
-            self.mic_cb.configure(state="disabled")
-            self.sys_cb.configure(state="disabled")
-            ttk.Label(f, text="Áudio indisponível. Instale: py -m pip install soundcard numpy",
-                      style="Muted.TLabel", wraplength=440).grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
-
-        ttk.Label(f, text="Pasta dos vídeos", style="Muted.TLabel").grid(row=10, column=0, sticky="w", pady=(8, 0))
-        ttk.Button(f, text="Alterar…", command=lambda: self.pick_folder(self.vfolder)
-                   ).grid(row=11, column=0, sticky="ew", padx=(0, 4))
-        ttk.Label(f, textvariable=self.enc_var, style="Muted.TLabel", wraplength=440
-                  ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.dl_btn = ttk.Button(f, text="Baixar FFmpeg (necessário, ~90 MB)", command=self.download_ffmpeg)
-        self.dl_btn.grid(row=13, column=0, columnspan=2, sticky="ew", pady=4)
-        ttk.Separator(f).grid(row=14, column=0, columnspan=2, sticky="ew", pady=10)
-        ttk.Label(f, textvariable=self.time_var, style="Big.TLabel").grid(row=15, column=0, sticky="w")
-        ttk.Label(f, textvariable=self.size_var, style="Head.TLabel").grid(row=15, column=1, sticky="e")
-        self.rec_btn = ttk.Button(f, text="●  Gravar", style="Rec.TButton", command=self.toggle_record)
-        self.rec_btn.grid(row=16, column=0, sticky="ew", padx=(0, 4), pady=(8, 0))
-        self.pause_btn = ttk.Button(f, text="Pausar", command=self.toggle_pause, state="disabled")
-        self.pause_btn.grid(row=16, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+        tk.Label(card, textvariable=self.time_var, bg=PANEL, fg="white", font=("Segoe UI", 28, "bold")
+                 ).grid(row=3, column=0, sticky="w", pady=(px(10), 0))
+        tk.Label(card, textvariable=self.size_var, bg=PANEL, fg=ACCENT, font=("Segoe UI", 12, "bold")
+                 ).grid(row=3, column=1, sticky="e", pady=(px(10), 0))
+        self.rec_btn = RoundBtn(card, "●  Gravar", command=self.toggle_record, kind="danger", bg=PANEL,
+                                font=("Segoe UI", 11, "bold"), pady=10)
+        self.rec_btn.grid(row=4, column=0, sticky="ew", pady=(px(6), 0))
+        self.pause_btn = RoundBtn(card, "Pausar", command=self.toggle_pause, bg=PANEL, pady=10)
+        self.pause_btn.grid(row=4, column=1, sticky="ew", padx=(px(8), 0), pady=(px(6), 0))
+        self.pause_btn.configure(state="disabled")
         self.on_target_change()
+
+        card2 = self.card(p, "Replay (guarda só os últimos segundos)", pady=(px(10), 0))
+        r2 = tk.Frame(card2, bg=PANEL)
+        r2.pack(fill="x")
+        Switch(r2, self.replay_var, command=self.toggle_replay, bg=PANEL).pack(side="left")
+        tk.Label(r2, text="Ligado", bg=PANEL, fg=FG, font=("Segoe UI", 10)).pack(side="left", padx=(px(8), px(14)))
+        self.cmb(r2, self.replay_len, ["15 s", "30 s", "60 s", "120 s"], width=7).pack(side="left")
+        self.replay_save_btn = RoundBtn(r2, "Salvar agora", command=self.save_replay, bg=PANEL, padx=14, pady=6)
+        self.replay_save_btn.pack(side="right")
+        self.replay_save_btn.configure(state="disabled")
 
     def on_target_change(self):
         t = self.rec_target.get()
@@ -1709,88 +2041,181 @@ class App:
                     return
         self.status.set("Área pequena demais ou fora dos monitores.")
 
-    def build_replay_tab(self, f):
-        f.columnconfigure((0, 1), weight=1)
-        ttk.Label(f, text="O replay fica gravando em segundo plano e guarda só os últimos segundos. "
-                          "Quando acontecer algo legal, aperte o atalho e o trecho é salvo.\n\n"
-                          "Usa os mesmos ajustes da aba Gravar (tela, resolução, FPS, áudio).",
-                  style="Muted.TLabel", wraplength=440).grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(f, text="Guardar os últimos", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(12, 0))
-        ttk.Combobox(f, textvariable=self.replay_len, state="readonly", values=["15 s", "30 s", "60 s", "120 s"]
-                     ).grid(row=2, column=0, sticky="ew", padx=(0, 4))
-        self.replay_btn = ttk.Button(f, text="Ligar replay", style="Accent.TButton", command=self.toggle_replay)
-        self.replay_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 4))
-        self.replay_save_btn = ttk.Button(f, text="Salvar replay agora", command=self.save_replay, state="disabled")
-        self.replay_save_btn.grid(row=4, column=0, columnspan=2, sticky="ew")
+    # ------------------------------------------------------------ perfis
+    def sync_profile(self):
+        cur = (self.rec_res.get(), self.rec_fps.get(), self.rec_quality.get())
+        self.profile.set(next((n for n, v in PROFILES.items() if v == cur), "Personalizado"))
 
-    def build_tools_tab(self, f):
-        f.columnconfigure((0, 1), weight=1)
-        self.tool_file = tk.StringVar()
-        self.t_start, self.t_end = tk.StringVar(), tk.StringVar()
-        self.dc_limit = tk.StringVar(value="10 MB")
-        self.precise = tk.BooleanVar(value=False)
-        self.gif_w, self.gif_fps = tk.StringVar(value="480"), tk.StringVar(value="15")
-        ttk.Label(f, text="Vídeo", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(f, text="Escolher…", command=self.pick_tool_file).grid(row=1, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(f, text="Última gravação", command=self.use_last_video).grid(row=1, column=1, sticky="ew", padx=(4, 0))
-        ttk.Label(f, textvariable=self.tool_file, style="Muted.TLabel", wraplength=440
-                  ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 6))
-        ttk.Separator(f).grid(row=3, column=0, columnspan=2, sticky="ew", pady=4)
-        ttk.Label(f, text="Reduzir para enviar no Discord", style="Head.TLabel").grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Combobox(f, textvariable=self.dc_limit, state="readonly", values=["10 MB", "25 MB", "50 MB", "100 MB"]
-                     ).grid(row=5, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(f, text="Reduzir", style="Accent.TButton", command=lambda: self.start_job("discord")
-                   ).grid(row=5, column=1, sticky="ew", padx=(4, 0))
-        ttk.Separator(f).grid(row=6, column=0, columnspan=2, sticky="ew", pady=8)
-        ttk.Label(f, text="Cortar / GIF (início e fim em mm:ss; vazio = tudo)", style="Head.TLabel"
-                  ).grid(row=7, column=0, columnspan=2, sticky="w")
-        ttk.Entry(f, textvariable=self.t_start).grid(row=8, column=0, sticky="ew", padx=(0, 4), pady=4)
-        ttk.Entry(f, textvariable=self.t_end).grid(row=8, column=1, sticky="ew", padx=(4, 0), pady=4)
-        ttk.Checkbutton(f, text="Corte preciso (mais lento)", variable=self.precise
-                        ).grid(row=9, column=0, sticky="w")
-        ttk.Button(f, text="Cortar", command=lambda: self.start_job("trim")).grid(row=9, column=1, sticky="ew", padx=(4, 0))
-        ttk.Combobox(f, textvariable=self.gif_w, state="readonly", values=["320", "480", "640"], width=6
-                     ).grid(row=10, column=0, sticky="w", pady=(6, 0))
-        ttk.Combobox(f, textvariable=self.gif_fps, state="readonly", values=["10", "15", "20"], width=6
-                     ).grid(row=10, column=0, sticky="e", pady=(6, 0))
-        ttk.Button(f, text="Exportar GIF", command=lambda: self.start_job("gif")
-                   ).grid(row=10, column=1, sticky="ew", padx=(4, 0), pady=(6, 0))
-        self.progress = ttk.Progressbar(f, maximum=100)
-        self.progress.grid(row=11, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+    def apply_profile(self, e=None):
+        pf = PROFILES.get(self.profile.get())
+        if pf:
+            self._applying = True
+            self.rec_res.set(pf[0])
+            self.rec_fps.set(pf[1])
+            self.rec_quality.set(pf[2])
+            self._applying = False
+            self.status.set(f"Perfil aplicado: {pf[0]}, {pf[1]} fps, {pf[2].split(' (')[0].lower()}.")
 
-    def build_history_tab(self, f):
-        f.columnconfigure(0, weight=1)
-        self.hist_list = tk.Listbox(f, bg=PANEL, fg=FG, selectbackground=ACCENT, highlightthickness=0, bd=0,
-                                    height=11, width=58, activestyle="none", font=("Segoe UI", 10))
-        self.hist_list.grid(row=0, column=0, columnspan=4, sticky="ew")
-        self.hist_list.bind("<Double-Button-1>", lambda e: self.hist_act("open"))
-        bf = ttk.Frame(f)
-        bf.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        for text, act in (("Abrir", "open"), ("Pasta", "folder"), ("Copiar", "copy"),
-                          ("Reduzir p/ Discord", "discord"), ("Remover", "remove")):
-            ttk.Button(bf, text=text, command=lambda a=act: self.hist_act(a)).pack(side="left", padx=(0, 4))
+    def mark_custom(self, *a):
+        if not self._applying:
+            self.sync_profile()
+
+    # ------------------------------------------------------------ FERRAMENTAS
+    def build_tools(self, p):
+        self.heading(p, "Ferramentas de vídeo", "Escolha um vídeo (ou use a última gravação) e aplique uma ação.")
+        c1 = self.card(p, "Vídeo")
+        r = tk.Frame(c1, bg=PANEL)
+        r.pack(fill="x")
+        RoundBtn(r, "Escolher…", command=self.pick_tool_file, bg=PANEL, padx=14, pady=6).pack(side="left")
+        RoundBtn(r, "Última gravação", command=self.use_last_video, bg=PANEL, padx=14, pady=6
+                 ).pack(side="left", padx=px(8))
+        tk.Label(c1, textvariable=self.tool_file, bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w",
+                 wraplength=px(500), justify="left").pack(fill="x", pady=(px(6), 0))
+
+        c2 = self.card(p, "Reduzir para enviar no Discord", pady=(px(8), 0))
+        r = tk.Frame(c2, bg=PANEL)
+        r.pack(fill="x")
+        self.lbl(r, "Limite de tamanho").pack(side="left")
+        self.cmb(r, self.dc_limit, ["10 MB", "25 MB", "50 MB", "100 MB"], width=8).pack(side="left", padx=px(10))
+        RoundBtn(r, "Reduzir", command=lambda: self.start_job("discord"), kind="accent", bg=PANEL, padx=18, pady=6
+                 ).pack(side="right")
+
+        c3 = self.card(p, "Cortar e exportar GIF", pady=(px(8), 0))
+        c3.columnconfigure((1, 3), weight=1)
+        self.lbl(c3, "Início").grid(row=0, column=0, sticky="w")
+        ttk.Entry(c3, textvariable=self.t_start, width=9).grid(row=0, column=1, sticky="w", padx=(px(6), px(14)))
+        self.lbl(c3, "Fim").grid(row=0, column=2, sticky="w")
+        ttk.Entry(c3, textvariable=self.t_end, width=9).grid(row=0, column=3, sticky="w", padx=(px(6), 0))
+        self.lbl(c3, "Formato mm:ss ou segundos. Vazio = vídeo todo.").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(2, px(6)))
+        r = tk.Frame(c3, bg=PANEL)
+        r.grid(row=2, column=0, columnspan=4, sticky="ew")
+        Switch(r, self.precise, bg=PANEL).pack(side="left")
+        self.lbl(r, "Corte preciso (mais lento)", muted=False).pack(side="left", padx=px(8))
+        RoundBtn(r, "Cortar", command=lambda: self.start_job("trim"), bg=PANEL, padx=18, pady=6).pack(side="right")
+        r = tk.Frame(c3, bg=PANEL)
+        r.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(px(8), 0))
+        self.lbl(r, "GIF: largura").pack(side="left")
+        self.cmb(r, self.gif_w, ["320", "480", "640"], width=5).pack(side="left", padx=px(6))
+        self.lbl(r, "fps").pack(side="left")
+        self.cmb(r, self.gif_fps, ["10", "15", "20"], width=4).pack(side="left", padx=px(6))
+        RoundBtn(r, "Exportar GIF", command=lambda: self.start_job("gif"), bg=PANEL, padx=18, pady=6).pack(side="right")
+        self.progress = ttk.Progressbar(p, maximum=100)
+        self.progress.pack(fill="x", pady=(px(12), 0))
+
+    # ------------------------------------------------------------ HISTÓRICO
+    def build_history(self, p):
+        self.heading(p, "Histórico", "Seus últimos prints e vídeos. Clique nos botões de cada item.")
+        wrap = tk.Frame(p, bg=BG)
+        wrap.pack(fill="both", expand=True)
+        self.hist_canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, height=px(400), width=px(540))
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.hist_canvas.yview)
+        self.hist_canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.hist_canvas.pack(side="left", fill="both", expand=True)
+        self.hist_inner = tk.Frame(self.hist_canvas, bg=BG)
+        self.hist_win = self.hist_canvas.create_window((0, 0), window=self.hist_inner, anchor="nw")
+        self.hist_inner.bind("<Configure>",
+                             lambda e: self.hist_canvas.configure(scrollregion=self.hist_canvas.bbox("all")))
+        self.hist_canvas.bind("<Configure>", lambda e: self.hist_canvas.itemconfigure(self.hist_win, width=e.width))
+        self.hist_canvas.bind("<Enter>", lambda e: self.hist_canvas.bind_all("<MouseWheel>", self._hist_wheel))
+        self.hist_canvas.bind("<Leave>", lambda e: self.hist_canvas.unbind_all("<MouseWheel>"))
         self.refresh_history()
 
-    def build_hotkeys_tab(self, f):
-        self.hk_vars = {}
-        f.columnconfigure(0, weight=1)
+    def _hist_wheel(self, e):
+        self.hist_canvas.yview_scroll(int(-e.delta / 120), "units")
+
+    # ------------------------------------------------------------ CONFIGURAÇÕES
+    def build_settings(self, p):
+        self.heading(p, "Configurações")
+        seg = Segmented(p, [("prints", "Prints"), ("video", "Vídeo"), ("audio", "Áudio"),
+                            ("keys", "Atalhos"), ("gen", "Geral")], self.show_cfg_section)
+        seg.pack(anchor="w", pady=(0, px(8)))
+        host = tk.Frame(p, bg=BG)
+        host.pack(fill="both", expand=True)
+        host.grid_rowconfigure(0, weight=1)
+        host.grid_columnconfigure(0, weight=1)
+        self.cfg_secs = {k: tk.Frame(host, bg=BG) for k in ("prints", "video", "audio", "keys", "gen")}
+        for f in self.cfg_secs.values():
+            f.grid(row=0, column=0, sticky="nsew")
+
+        c = self.card(self.cfg_secs["prints"])
+        sm = self.cmb(c, self.snap_mode, SNAP_MODES, width=38)
+        sm.bind("<<ComboboxSelected>>", lambda e: self.use_editor.set(self.snap_mode.get() == SNAP_MODES[0]))
+        self.form_row(c, 0, "Ao selecionar uma área", sm)
+        self.form_row(c, 1, "Formato ao salvar", self.cmb(c, self.fmt, ["PNG", "JPEG (q100)", "WebP (lossless)"], width=18))
+        self.form_row(c, 2, "Atraso antes de capturar (s)", ttk.Spinbox(c, from_=0, to=30, textvariable=self.delay, width=6))
+        rf = tk.Frame(c, bg=PANEL)
+        RoundBtn(rf, "Alterar pasta…", command=lambda: self.pick_folder(self.folder), bg=PANEL, padx=12, pady=5,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.form_row(c, 3, "Pasta dos prints", rf)
+        tk.Label(c, textvariable=self.folder, bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w", wraplength=px(480),
+                 justify="left").grid(row=4, column=0, columnspan=2, sticky="w")
+        self.lbl(c, "Dica: no editor, Ctrl+C copia, Ctrl+S salva e Esc cancela.").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(px(8), 0))
+
+        c = self.card(self.cfg_secs["video"])
+        self.form_row(c, 0, "Resolução", self.cmb(c, self.rec_res, list(RES_MAP), width=14))
+        self.form_row(c, 1, "FPS", self.cmb(c, self.rec_fps, ["24", "30", "60"], width=14))
+        self.form_row(c, 2, "Qualidade", self.cmb(c, self.rec_quality, QUALITY, width=24))
+        rf = tk.Frame(c, bg=PANEL)
+        RoundBtn(rf, "Alterar pasta…", command=lambda: self.pick_folder(self.vfolder), bg=PANEL, padx=12, pady=5,
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self.form_row(c, 3, "Pasta dos vídeos", rf)
+        tk.Label(c, textvariable=self.vfolder, bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w", wraplength=px(480),
+                 justify="left").grid(row=4, column=0, columnspan=2, sticky="w")
+        tk.Label(c, textvariable=self.enc_var, bg=PANEL, fg=FG, font=("Segoe UI", 9), anchor="w", wraplength=px(480),
+                 justify="left").grid(row=5, column=0, columnspan=2, sticky="w", pady=(px(8), 0))
+        self.dl_btn = RoundBtn(c, "Baixar FFmpeg (necessário, ~90 MB)", command=self.download_ffmpeg, kind="accent",
+                               bg=PANEL, padx=14, pady=7)
+        self.dl_btn.grid(row=6, column=0, columnspan=2, sticky="w", pady=(px(6), 0))
+        self.lbl(c, "Qualidade alta grava arquivos maiores. Para enviar no Discord, use a aba Ferramentas.").grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(px(8), 0))
+
+        c = self.card(self.cfg_secs["audio"])
+        self.mic_cb = self.cmb(c, self.rec_mic, ["Nenhum"] + self.mics, width=34)
+        self.sys_cb = self.cmb(c, self.rec_sys, ["Nenhum"] + self.spks, width=34)
+        self.form_row(c, 0, "Microfone", self.mic_cb)
+        self.form_row(c, 1, "Áudio do computador", self.sys_cb)
+        self.form_row(c, 2, "Ajuste de sincronia (ms)", ttk.Spinbox(c, from_=-500, to=1000, increment=50,
+                                                                   textvariable=self.audio_offset, width=8))
+        self.lbl(c, "Se o som estiver adiantado em relação ao vídeo, aumente o número.\n"
+                    "Se estiver atrasado, use um número negativo.").grid(row=3, column=0, columnspan=2, sticky="w")
+        if self.audio_err:
+            self.mic_cb.configure(state="disabled")
+            self.sys_cb.configure(state="disabled")
+            self.lbl(c, "Áudio indisponível. No PowerShell: py -m pip install soundcard numpy", muted=False
+                     ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(px(8), 0))
+
+        c = self.card(self.cfg_secs["keys"])
         for i, (k, label) in enumerate(HK_NAMES.items()):
-            ttk.Label(f, text=label).grid(row=i, column=0, sticky="w", pady=5)
-            v = tk.StringVar(value=self.hotkeys[k])
-            self.hk_vars[k] = v
-            ttk.Label(f, textvariable=v, style="Key.TLabel").grid(row=i, column=1, padx=10)
-            ttk.Button(f, text="Alterar", command=lambda k=k: self.change_hotkey(k)).grid(row=i, column=2)
-        n = len(HK_NAMES)
-        ttk.Button(f, text="Restaurar padrão", command=self.reset_hotkeys
-                   ).grid(row=n, column=0, columnspan=3, sticky="w", pady=(10, 4))
-        ttk.Separator(f).grid(row=n + 1, column=0, columnspan=3, sticky="ew", pady=6)
-        ttk.Checkbutton(f, text="Iniciar junto com o Windows (na bandeja)", variable=self.autostart,
-                        command=self.on_autostart).grid(row=n + 2, column=0, columnspan=3, sticky="w", pady=2)
-        ttk.Checkbutton(f, text="Fechar a janela (X) mantém o app na bandeja", variable=self.close_tray
-                        ).grid(row=n + 3, column=0, columnspan=3, sticky="w", pady=2)
+            self.lbl(c, label, muted=False).grid(row=i, column=0, sticky="w", pady=px(4))
+            tk.Label(c, textvariable=self.hk_vars[k], bg="#1f2023", fg="white", font=("Consolas", 10, "bold"),
+                     padx=px(10), pady=px(3)).grid(row=i, column=1, padx=px(12))
+            RoundBtn(c, "Alterar", command=lambda k=k: self.change_hotkey(k), bg=PANEL, padx=12, pady=4,
+                     font=("Segoe UI", 9, "bold")).grid(row=i, column=2)
+        RoundBtn(c, "Restaurar padrão", command=self.reset_hotkeys, bg=PANEL, padx=12, pady=5,
+                 font=("Segoe UI", 9, "bold")).grid(row=len(HK_NAMES), column=0, sticky="w", pady=(px(10), 0))
         if keyboard is None:
-            ttk.Label(f, text="Instale 'keyboard' para usar atalhos globais.", style="Muted.TLabel"
-                      ).grid(row=n + 4, column=0, columnspan=3, sticky="w", pady=4)
+            self.lbl(c, "Instale 'keyboard' para usar atalhos globais.").grid(
+                row=len(HK_NAMES) + 1, column=0, columnspan=3, sticky="w")
+
+        c = self.card(self.cfg_secs["gen"])
+        r = tk.Frame(c, bg=PANEL)
+        r.pack(fill="x", pady=px(5))
+        Switch(r, self.autostart, command=self.on_autostart, bg=PANEL).pack(side="left")
+        self.lbl(r, "Iniciar junto com o Windows (na bandeja)", muted=False).pack(side="left", padx=px(10))
+        r = tk.Frame(c, bg=PANEL)
+        r.pack(fill="x", pady=px(5))
+        Switch(r, self.close_tray, bg=PANEL).pack(side="left")
+        self.lbl(r, "Fechar a janela (X) mantém o app na bandeja", muted=False).pack(side="left", padx=px(10))
+        RoundBtn(c, f"Verificar atualização (v{VERSION})", command=self.check_update, bg=PANEL, padx=14, pady=7
+                 ).pack(anchor="w", pady=(px(10), 0))
+        self.show_cfg_section("prints")
+        seg.select("prints")
+
+    def show_cfg_section(self, key):
+        self.cfg_secs[key].tkraise()
 
     # ------------------------------------------------------------ geral
     def save_cfg(self):
@@ -1800,7 +2225,7 @@ class App:
                     "fps": self.rec_fps.get(), "quality": self.rec_quality.get(), "mic": self.rec_mic.get(),
                     "sys": self.rec_sys.get(), "hotkeys": self.hotkeys, "replay_len": self.replay_len.get(),
                     "close_tray": self.close_tray.get(), "history": self.history,
-                    "audio_offset_ms": self.cfg.get("audio_offset_ms", 0)}
+                    "audio_offset_ms": self.get_offset(), "v": 4}
             CONFIG.write_text(json.dumps(data), encoding="utf-8")
         except Exception:
             pass
@@ -1869,36 +2294,72 @@ class App:
 
     def refresh_history(self):
         self.history = [h for h in self.history if Path(h[0]).exists()]
-        self.hist_list.delete(0, "end")
-        names = {"print": "Print", "video": "Vídeo", "replay": "Replay", "tool": "Arquivo"}
-        for p, kind, ts in self.history:
-            self.hist_list.insert("end", f"{ts}   {names.get(kind, kind)}   {Path(p).name}")
-
-    def hist_act(self, act):
-        sel = self.hist_list.curselection()
-        if not sel:
-            self.status.set("Selecione um item da lista.")
+        for w in self.hist_inner.winfo_children():
+            w.destroy()
+        self.hist_imgs = {}
+        if not self.history:
+            tk.Label(self.hist_inner, text="Nada por aqui ainda.\nSeus prints e vídeos aparecem nesta lista.",
+                     bg=BG, fg=MUTED, font=("Segoe UI", 10), justify="center").pack(pady=px(40), padx=px(60))
             return
-        item = self.history[sel[0]]
+        size = (px(96), px(54))
+        self.hist_imgs["blank"] = blank = ImageTk.PhotoImage(Image.new("RGB", size, "#111111"))
+        names = {"print": "Print", "video": "Vídeo", "replay": "Replay", "tool": "Arquivo"}
+        pending = []
+        for i, (path, kind, ts) in enumerate(self.history[:40]):
+            row = tk.Frame(self.hist_inner, bg=PANEL)
+            row.pack(fill="x", pady=3)
+            th = tk.Label(row, image=blank, bg="#111111", bd=0)
+            th.pack(side="left", padx=px(8), pady=px(8))
+            info = tk.Frame(row, bg=PANEL)
+            info.pack(side="left", fill="x", expand=True)
+            tk.Label(info, text=Path(path).name, bg=PANEL, fg="white", font=("Segoe UI", 10, "bold"),
+                     anchor="w").pack(fill="x")
+            try:
+                fsize = fmt_size(Path(path).stat().st_size)
+            except OSError:
+                fsize = ""
+            tk.Label(info, text=f"{names.get(kind, kind)}  •  {ts}  •  {fsize}", bg=PANEL, fg=MUTED,
+                     font=("Segoe UI", 9), anchor="w").pack(fill="x")
+            btns = tk.Frame(info, bg=PANEL)
+            btns.pack(fill="x", pady=(px(4), 0))
+            is_img = Path(path).suffix.lower() in IMG_EXT
+            acts = [("Abrir", "open"), ("Pasta", "folder"), ("Copiar", "copy") if is_img else ("p/ Discord", "discord"),
+                    ("Remover", "remove")]
+            for text, act in acts:
+                RoundBtn(btns, text, command=lambda a=act, i=i: self.hist_act(a, i), kind="ghost", bg=PANEL,
+                         font=("Segoe UI", 9), padx=8, pady=3).pack(side="left", padx=(0, 2))
+            pending.append((th, path))
+        threading.Thread(target=self._load_thumbs, args=(pending, size), daemon=True).start()
+
+    def _load_thumbs(self, pending, size):
+        for th, path in pending:
+            im = make_thumb(path, self.ffmpeg, size)
+            if im is not None:
+                self.ui_queue.put(lambda th=th, im=im: self._set_thumb(th, im))
+
+    def _set_thumb(self, th, im):
+        with contextlib.suppress(tk.TclError):
+            ph = ImageTk.PhotoImage(im)
+            th.configure(image=ph)
+            self.hist_imgs[str(th)] = ph
+
+    def hist_act(self, act, idx):
+        if idx >= len(self.history):
+            return
+        item = self.history[idx]
         path = Path(item[0])
         if act == "open":
             os.startfile(str(path))
         elif act == "folder":
             self.open_folder(path)
         elif act == "copy":
-            if item[1] == "print" and path.suffix.lower() in (".png", ".jpg", ".webp"):
-                copy_to_clipboard(Image.open(path))
-                self.status.set("Imagem copiada.")
-            else:
-                self.status.set("Só dá para copiar imagens.")
+            copy_to_clipboard(Image.open(path))
+            self.status.set("Imagem copiada.")
         elif act == "discord":
-            if path.suffix.lower() in (".mp4", ".mkv", ".mov", ".webm"):
-                self.tool_file.set(str(path))
-                self.start_job("discord")
-            else:
-                self.status.set("Escolha um vídeo.")
+            self.tool_file.set(str(path))
+            self.start_job("discord")
         elif act == "remove":
-            del self.history[sel[0]]
+            del self.history[idx]
             self.save_cfg()
             self.refresh_history()
 
@@ -1920,6 +2381,8 @@ class App:
     def on_hotkey(self, k):
         if k in ("region", "window", "full"):
             self.capture(k)
+        elif k == "region_quick":
+            self.capture("quick")
         elif k == "rec":
             self.toggle_record()
         elif k == "pause":
@@ -1981,7 +2444,7 @@ class App:
             if mode == "full" and not self.use_editor.get():
                 self.finish_snap(prev, img, True, False)
                 return
-            SnapOverlay(self, img, left, top, prev, mode=mode)
+            SnapOverlay(self, img, left, top, prev, mode="region" if mode == "quick" else mode, quick=(mode == "quick"))
         except Exception as ex:
             self.status.set(f"Erro: {ex}")
             self.restore(prev)
@@ -2089,6 +2552,12 @@ class App:
                                                  self.dl_btn.configure(state="normal")))
         threading.Thread(target=work, daemon=True).start()
 
+    def get_offset(self):
+        try:
+            return int(self.audio_offset.get())
+        except Exception:
+            return 0
+
     def make_opts(self):
         """Monta as opções de gravação/replay a partir da tela. Retorna None se algo faltar."""
         if not self.ffmpeg:
@@ -2118,7 +2587,7 @@ class App:
         return {"ffmpeg": self.ffmpeg, "kind": kind, "mon": mon, "out_idx": idx, "area": area, "title": title,
                 "fps": int(self.rec_fps.get()), "height": RES_MAP.get(self.rec_res.get(), 0),
                 "quality": QUALITY.index(self.rec_quality.get()), "encoder": self.encoder or "libx264",
-                "mic": mic, "spk": spk, "offset_ms": int(self.cfg.get("audio_offset_ms", 0))}
+                "mic": mic, "spk": spk, "offset_ms": self.get_offset()}
 
     # ------------------------------------------------------------ gravação
     def update_rec_ui(self):
@@ -2127,8 +2596,7 @@ class App:
         self.rec_btn.configure(text="■  Parar" if busy else "●  Gravar",
                                state="disabled" if st in ("finalizing", "replay") else "normal")
         self.pause_btn.configure(text="Retomar" if st == "paused" else "Pausar", state="normal" if busy else "disabled")
-        self.replay_btn.configure(text="Desligar replay" if st == "replay" else "Ligar replay",
-                                  state="disabled" if st in ("recording", "paused", "finalizing") else "normal")
+        self.replay_var.set(st == "replay")
         self.replay_save_btn.configure(state="normal" if st == "replay" else "disabled")
         if self.minibar and hasattr(self, "mb_pause"):
             with contextlib.suppress(tk.TclError):
@@ -2265,28 +2733,29 @@ class App:
 
     # ------------------------------------------------------------ replay
     def toggle_replay(self):
-        if self.rec.state == "replay":
-            self.rec.stop_replay()
-            self.close_minibar()
-            self.update_rec_ui()
-            self.status.set("Replay desligado.")
-            return
-        if self.rec.state != "idle":
-            self.status.set("Pare a gravação antes de ligar o replay.")
-            return
-        opts = self.make_opts()
-        if not opts:
-            return
-        secs = int(self.replay_len.get().split()[0])
         try:
-            self.rec.start_replay(opts, secs)
-        except Exception as ex:
-            self.status.set(f"Não consegui ligar o replay: {ex}")
-            self.rec.state = "idle"
-            return
-        self.update_rec_ui()
-        self.show_minibar(replay=True)
-        self.status.set(f"Replay ligado: guardando os últimos {secs} s. Atalho: {self.hotkeys['replay_save']}")
+            if self.rec.state == "replay":
+                self.rec.stop_replay()
+                self.close_minibar()
+                self.status.set("Replay desligado.")
+                return
+            if self.rec.state != "idle":
+                self.status.set("Pare a gravação antes de ligar o replay.")
+                return
+            opts = self.make_opts()
+            if not opts:
+                return
+            secs = int(self.replay_len.get().split()[0])
+            try:
+                self.rec.start_replay(opts, secs)
+            except Exception as ex:
+                self.status.set(f"Não consegui ligar o replay: {ex}")
+                self.rec.state = "idle"
+                return
+            self.show_minibar(replay=True)
+            self.status.set(f"Replay ligado: guardando os últimos {secs} s. Atalho: {self.hotkeys['replay_save']}")
+        finally:
+            self.update_rec_ui()
 
     def save_replay(self):
         if self.rec.state != "replay":
@@ -2432,4 +2901,16 @@ if __name__ == "__main__":
     if "--make-icon" in sys.argv:  # usado pelo build_exe.bat
         make_icon(256).save("print_hq.ico", sizes=[(256, 256), (64, 64), (32, 32), (16, 16)])
         sys.exit(0)
-    App().run()
+    try:
+        App().run()
+    except Exception:  # sem console no pythonw: mostra o erro em uma janela e salva em arquivo
+        import traceback
+        err = traceback.format_exc()
+        with contextlib.suppress(Exception):
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            (APP_DIR / "error.log").write_text(err, encoding="utf-8")
+        with contextlib.suppress(Exception):
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showerror("Print HQ - erro ao iniciar", err[-1500:])
+        sys.exit(1)
