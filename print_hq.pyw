@@ -1,5 +1,5 @@
 """
-Print HQ v4.0
+Print HQ v4.2
   Prints com editor embutido (setas, formas, texto, censura, marca-texto, numeração, OCR, fixar na tela)
   Gravação leve (FFmpeg) de monitor, janela ou área + replay dos últimos segundos
   Ferramentas: reduzir p/ Discord, cortar, GIF  |  Histórico  |  Ícone na bandeja  |  Atalhos editáveis
@@ -58,7 +58,7 @@ try:
 except Exception:
     winreg = None
 
-VERSION = "4.0.0"
+VERSION = "4.2.0"
 UPDATE_URL = "https://raw.githubusercontent.com/antonioexpedito020-code/print-hq/main/print_hq.pyw"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 CONFIG = Path.home() / ".print_hq.json"
@@ -78,7 +78,7 @@ HK_DEFAULT = {"region": "ctrl+alt+a", "region_quick": "ctrl+alt+q", "window": "c
 
 RES_MAP = {"Original": 0, "1440p": 1440, "1080p": 1080, "720p": 720, "480p": 480}
 QUALITY = ["Leve (arquivo pequeno)", "Equilibrada", "Alta qualidade", "Máxima"]
-QV = {"libx264": [29, 24, 20, 17], "h264_nvenc": [31, 26, 22, 18], "h264_amf": [31, 26, 22, 18],
+QV = {"libx264": [29, 25, 22, 18], "h264_nvenc": [31, 26, 22, 18], "h264_amf": [31, 26, 22, 18],
       "h264_qsv": [31, 26, 22, 18]}
 PROFILES = {  # (resolução, fps, qualidade)
     "Equilibrado - 1080p 60 fps": ("1080p", "60", QUALITY[1]),
@@ -91,6 +91,8 @@ PROFILES = {  # (resolução, fps, qualidade)
 ENC_LABEL = {"h264_nvenc": "placa NVIDIA (NVENC) - leve para o PC", "h264_amf": "placa AMD (AMF) - leve para o PC",
              "h264_qsv": "Intel (QuickSync) - leve para o PC", "libx264": "processador (x264)"}
 WIN_LABEL, AREA_LABEL = "Uma janela específica", "Uma área da tela"
+CAP_MODES = ["Automático (recomendado)", "Compatível (usa mais o processador)"]
+ENC_MODES = ["Automático (menor arquivo)", "Processador (x264, menor arquivo)", "Placa de vídeo (mais leve para o PC)"]
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
@@ -229,6 +231,24 @@ def save_image(img, folder, fmt):
     return path
 
 
+def open_path(p):
+    try:
+        open_path(p)
+    except Exception:
+        with contextlib.suppress(Exception):
+            subprocess.Popen(["xdg-open", str(p)])
+
+
+def _open_clipboard():
+    for _ in range(8):  # outro programa pode estar usando a área de transferência por um instante
+        try:
+            win32clipboard.OpenClipboard()
+            return
+        except Exception:
+            time.sleep(0.05)
+    raise RuntimeError("A área de transferência está ocupada por outro programa. Tente de novo.")
+
+
 def copy_to_clipboard(img):
     if win32clipboard is None:
         return False
@@ -238,7 +258,7 @@ def copy_to_clipboard(img):
     dib = bmp.getvalue()[14:]
     png = io.BytesIO()
     rgb.save(png, "PNG")
-    win32clipboard.OpenClipboard()
+    _open_clipboard()
     try:
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32clipboard.CF_DIB, dib)
@@ -252,7 +272,7 @@ def copy_to_clipboard(img):
 def copy_text(txt):
     if win32clipboard is None:
         return False
-    win32clipboard.OpenClipboard()
+    _open_clipboard()
     try:
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, txt)
@@ -476,33 +496,69 @@ def find_ffmpeg():
     return str(local) if local.exists() else None
 
 
-def detect_encoder(ffmpeg):
-    """Testa de verdade qual codificador por placa de vídeo funciona neste PC."""
-    for enc in ("h264_nvenc", "h264_amf", "h264_qsv"):
-        try:
-            r = subprocess.run(
-                [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                 "color=c=black:s=1280x720:r=30", "-frames:v", "3", "-vf", "format=nv12",
-                 "-c:v", enc, "-f", "null", "-"],
-                capture_output=True, timeout=20, creationflags=NOWIN)
-            if r.returncode == 0:
-                return enc
-        except Exception:
-            pass
-    return "libx264"
+BASE_CAP = [6000, 10000, 16000, 28000]  # kbps no limite, em 1080p a 60 fps (por qualidade)
 
 
-def enc_args(enc, qi, fps):
-    q, g = QV[enc][qi], str(fps * 2)
+def bitrate_cap(qi, w, h, fps):
+    """Teto de bitrate: garante que o arquivo nunca explode, mesmo em cenas muito rápidas."""
+    k = BASE_CAP[qi] * (w * h * fps) / (1920 * 1080 * 60)
+    return int(min(80000, max(1500, k)))
+
+
+def out_dims(o):
+    kind, mon = o["kind"], o["mon"]
+    if kind == "area":
+        w, h = o["area"][2], o["area"][3]
+    elif kind == "window":
+        w, h = 1920, 1080
+    else:
+        w, h = mon["width"], mon["height"]
+    if o["height"] and o["height"] < h:
+        w, h = int(w * o["height"] / h) // 2 * 2, o["height"]
+    return w, h
+
+
+def enc_args(enc, qi, fps, cap=None, rich=True):
+    # quadro completo (keyframe) só a cada ~8 s: em tela parada isso economiza muito. O replay força os seus próprios.
+    q, g = QV[enc][qi], str(fps * 8)
+    cap = cap or 20000
+    rate = ["-maxrate", f"{cap}k", "-bufsize", f"{cap * 2}k"]
     if enc == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(q), "-b:v", "0",
-                "-profile:v", "high", "-g", g]
+        a = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(q), "-b:v", "0",
+             "-profile:v", "high", "-g", g]
+        if rich:  # qualidade extra: ajuste adaptativo, olhar à frente e B-frames
+            a += ["-tune", "hq", "-spatial-aq", "1", "-aq-strength", "8", "-rc-lookahead", "16", "-bf", "2"] + rate
+        return a
     if enc == "h264_amf":
-        return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", str(q),
-                "-qp_p", str(q + 2), "-g", g]
+        return ["-c:v", "h264_amf", "-quality", "quality" if rich else "balanced", "-rc", "cqp",
+                "-qp_i", str(q), "-qp_p", str(q + 2), "-g", g]
     if enc == "h264_qsv":
-        return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", str(q), "-g", g]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(q), "-profile:v", "high", "-g", g]
+        return ["-c:v", "h264_qsv", "-preset", "medium" if rich else "veryfast", "-global_quality", str(q), "-g", g]
+    preset = "faster" if qi < 2 else "fast"  # mais eficiente que "veryfast" (arquivo menor, um pouco mais de CPU)
+    return ["-c:v", "libx264", "-preset", preset, "-crf", str(q), "-profile:v", "high", "-g", g] + rate
+
+
+def _run_test(cmd, timeout):
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=NOWIN).returncode == 0
+    except Exception:
+        return False
+
+
+def detect_hw(ff):
+    """Testa de verdade o que este PC suporta: codificador da placa, ajustes extras e captura direta na GPU."""
+    base = [ff, "-hide_banner", "-loglevel", "error"]
+    for enc in ("h264_nvenc", "h264_amf", "h264_qsv"):
+        def enc_test(rich, enc=enc):
+            return _run_test(base + ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30", "-frames:v", "10",
+                                     "-vf", "format=nv12"] + enc_args(enc, 1, 30, 8000, rich) + ["-f", "null", "-"], 30)
+        if enc_test(False):
+            rich = enc_test(True)
+            gpu = enc in ("h264_nvenc", "h264_amf") and _run_test(
+                base + ["-f", "lavfi", "-i", "ddagrab=output_idx=0:framerate=30", "-frames:v", "12"]
+                + enc_args(enc, 1, 30, 8000, rich) + ["-f", "null", "-"], 40)
+            return {"encoder": enc, "rich": rich, "gpu": gpu}
+    return {"encoder": "libx264", "rich": True, "gpu": False}
 
 
 def video_filter(backend, height, pix):
@@ -517,7 +573,8 @@ def video_filter(backend, height, pix):
     return ",".join(f)
 
 
-def build_cmd(ff, o, out, backend, audio, replay_wrap=None):
+def build_cmd(ff, o, out, backend, audio, replay_wrap=None, gpu=False):
+    """gpu=True: a imagem vai direto da captura para o codificador da placa, sem passar pelo processador."""
     fps, mon, kind = o["fps"], o["mon"], o["kind"]
     cmd = [ff, "-y", "-hide_banner", "-loglevel", "error", "-nostats"]
     if kind == "window":
@@ -537,12 +594,14 @@ def build_cmd(ff, o, out, backend, audio, replay_wrap=None):
                 "-offset_y", str(ay), "-video_size", f"{aw}x{ah}", "-i", "desktop"]
     if audio:
         cmd += ["-thread_queue_size", "1024", "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "pipe:0"]
-    pix = "yuv420p" if o["encoder"] == "libx264" else "nv12"
-    cmd += ["-vf", video_filter("gdigrab" if kind == "window" else backend, o["height"], pix)]
-    cmd += enc_args(o["encoder"], o["quality"], fps)
+    if not (gpu and backend == "ddagrab"):
+        pix = "yuv420p" if o["encoder"] == "libx264" else "nv12"
+        cmd += ["-vf", video_filter("gdigrab" if kind == "window" else backend, o["height"], pix)]
+    ow, oh = out_dims(o)
+    cmd += enc_args(o["encoder"], o["quality"], fps, bitrate_cap(o["quality"], ow, oh, fps), o.get("rich", True))
     cmd += ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
     if audio:
-        cmd += ["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-shortest"]
+        cmd += ["-c:a", "aac", "-b:a", f"{[96, 128, 160, 192][o['quality']]}k", "-ar", "48000", "-shortest"]
     if replay_wrap:  # replay: anel de pedaços de 2 s que se sobrescrevem
         cmd += ["-force_key_frames", "expr:gte(t,n_forced*2)", "-f", "segment", "-segment_time", "2",
                 "-segment_wrap", str(replay_wrap), "-segment_format", "mpegts", "-reset_timestamps", "1"]
@@ -646,7 +705,8 @@ class Recorder:
         self.mode = "record"
         self.proc = self.feeder = self.logf = None
         self.segments, self.acc, self.seg_t0 = [], 0.0, 0.0
-        self.opts, self.tmp, self.backend, self.retried = None, None, "ddagrab", False
+        self.opts, self.tmp = None, None
+        self.stages, self.stage_i = [], 0
         self.replay_secs = 30
 
     def elapsed(self):
@@ -659,12 +719,14 @@ class Recorder:
                 total += s.stat().st_size
         return total
 
-    def _first_backend(self, opts):
-        return "gdigrab" if opts["kind"] == "window" else "ddagrab"
+    def _stages(self, opts):
+        if opts["kind"] == "window":
+            return [("gdigrab", False)]
+        return ([("ddagrab", True)] if opts.get("gpu") else []) + [("ddagrab", False), ("gdigrab", False)]
 
     def start(self, opts):
-        self.mode, self.opts, self.retried = "record", opts, False
-        self.backend = self._first_backend(opts)
+        self.mode, self.opts = "record", opts
+        self.stages, self.stage_i = self._stages(opts), 0
         self.segments, self.acc = [], 0.0
         self.tmp = APP_DIR / "tmp" / datetime.now().strftime("%Y%m%d_%H%M%S")
         self.tmp.mkdir(parents=True, exist_ok=True)
@@ -673,8 +735,8 @@ class Recorder:
         self.app.root.after(2200, self._health)
 
     def start_replay(self, opts, secs):
-        self.mode, self.opts, self.retried, self.replay_secs = "replay", opts, False, secs
-        self.backend = self._first_backend(opts)
+        self.mode, self.opts, self.replay_secs = "replay", opts, secs
+        self.stages, self.stage_i = self._stages(opts), 0
         self.segments = []
         self.tmp = APP_DIR / "replay"
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -685,17 +747,21 @@ class Recorder:
 
     def _launch(self):
         o, n = self.opts, len(self.segments)
+        backend, gpu = self.stages[self.stage_i]
         audio = bool(o["mic"] or o["spk"])
         if self.mode == "replay":
             need = int(self.replay_secs / 2) + 2
-            cmd = build_cmd(o["ffmpeg"], o, self.tmp / "rp%03d.ts", self.backend, audio, replay_wrap=need + 3)
+            cmd = build_cmd(o["ffmpeg"], o, self.tmp / "rp%03d.ts", backend, audio, replay_wrap=need + 3, gpu=gpu)
         else:
             seg = self.tmp / f"seg{n:03d}.mkv"
             self.segments.append(seg)
-            cmd = build_cmd(o["ffmpeg"], o, seg, self.backend, audio)
+            cmd = build_cmd(o["ffmpeg"], o, seg, backend, audio, gpu=gpu)
         self.logf = open(self.tmp / f"log{n}.txt", "wb")
+        flags = NOWIN
+        if sys.platform == "win32" and o["encoder"] == "libx264":
+            flags |= 0x4000  # prioridade menor: o jogo continua com os núcleos do processador
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                     stderr=self.logf, creationflags=NOWIN)
+                                     stderr=self.logf, creationflags=flags)
         self.feeder = None
         if audio:
             self.feeder = AudioFeeder(self.proc.stdin, o["mic"], o["spk"], o.get("offset_ms", 0))
@@ -711,16 +777,17 @@ class Recorder:
         return txt.strip()[-600:]
 
     def _health(self):
-        """Se o FFmpeg morreu logo no início, tenta o método alternativo (gdigrab)."""
+        """Se o FFmpeg morreu logo no início, desce para o próximo modo de captura."""
         if self.state not in ("recording", "replay") or self.proc is None or self.proc.poll() is None:
             return
         err = self.tail_logs()
-        if self.backend == "ddagrab" and not self.retried:
-            self.retried, self.backend = True, "gdigrab"
+        if self.stage_i + 1 < len(self.stages):
+            self.stage_i += 1
             self._kill()
             if self.mode == "record" and self.segments:
                 self.segments.pop()
             self._launch()
+            self.app.ui_queue.put(lambda: self.app.status.set("Usando o modo de captura compatível…"))
             self.app.root.after(2200, self._health)
         else:
             self.app.ui_queue.put(lambda: self.app.rec_failed(err))
@@ -856,11 +923,11 @@ def discord_cmd(ff, src, out, dur, mb):
             "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(out)]
 
 
-def trim_cmd(ff, src, out, start, span, precise, enc, qi):
+def trim_cmd(ff, src, out, start, span, precise, enc, qi, rich=True):
     cmd = [ff, "-y", "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{span:.3f}"]
     if precise:
         cmd += ["-vf", "format=yuv420p" if enc == "libx264" else "format=nv12"]
-        cmd += enc_args(enc, qi, 60) + ["-c:a", "aac", "-b:a", "160k"]
+        cmd += enc_args(enc, qi, 60, rich=rich) + ["-c:a", "aac", "-b:a", "160k"]
     else:
         cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero"]
     return cmd + ["-movflags", "+faststart", str(out)]
@@ -872,9 +939,17 @@ def gif_cmd(ff, src, out, start, span, width, fps):
     return [ff, "-y", "-ss", f"{start:.3f}", "-t", f"{span:.3f}", "-i", str(src), "-vf", vf, "-loop", "0", str(out)]
 
 
-def run_job(cmd, total, on_progress):
+def optimize_cmd(ff, src, out, qi):
+    crf = [31, 27, 24, 20][qi]  # um pouco acima do da gravação: aqui o objetivo é encolher
+    return [ff, "-y", "-i", str(src), "-c:v", "libx264", "-preset", "slow", "-crf", str(crf), "-g", "600",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy", "-movflags", "+faststart", str(out)]
+
+
+def run_job(cmd, total, on_progress, low=False):
     full = cmd[:1] + ["-progress", "pipe:1", "-nostats", "-loglevel", "error"] + cmd[1:]
-    p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NOWIN)
+    p = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         creationflags=NOWIN | (0x4000 if low and sys.platform == "win32" else 0))
     errs = []
     for line in p.stdout:
         s = line.decode(errors="ignore").strip()
@@ -1796,10 +1871,15 @@ class App:
         self.sync_profile()
         self.audio_offset = tk.IntVar(value=int(cfg.get("audio_offset_ms", 0)))
         self.replay_len = V("replay_len", "30 s")
+        self.cap_mode = V("cap_mode", CAP_MODES[0])
+        self.enc_mode = V("enc_mode", ENC_MODES[0])
+        self.auto_opt = tk.BooleanVar(value=cfg.get("auto_opt", True) if cfg.get("v") == 5 else True)
+        self.est_var = tk.StringVar(value="")
+        self.hw, self.hw_ready, self._hk_last = {"encoder": "libx264", "rich": True, "gpu": False}, False, {}
         self.replay_var = tk.BooleanVar(value=False)
         self.close_tray = tk.BooleanVar(value=cfg.get("close_tray", True))
         self.autostart = tk.BooleanVar(value=get_autostart())
-        self.precise = tk.BooleanVar(value=False)
+        self.precise = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Pronto.")
         self.time_var = tk.StringVar(value="00:00:00")
         self.size_var = tk.StringVar(value="0.0 MB")
@@ -1823,10 +1903,14 @@ class App:
             self.rec_sys.set(default or "Nenhum")
 
         for v in (self.folder, self.fmt, self.use_editor, self.vfolder, self.rec_target, self.rec_res, self.rec_fps,
-                  self.rec_quality, self.rec_mic, self.rec_sys, self.replay_len, self.close_tray, self.audio_offset):
+                  self.rec_quality, self.rec_mic, self.rec_sys, self.replay_len, self.close_tray, self.audio_offset, self.cap_mode, self.auto_opt, self.enc_mode):
             v.trace_add("write", lambda *a: self.save_cfg())
         for v in (self.rec_res, self.rec_fps, self.rec_quality):
             v.trace_add("write", self.mark_custom)
+        for v in (self.rec_res, self.rec_fps, self.rec_quality, self.rec_target):
+            v.trace_add("write", self.update_estimate)
+        self.cap_mode.trace_add("write", self.refresh_enc_label)
+        self.enc_mode.trace_add("write", self.refresh_enc_label)
 
         self.cap_icons = {n: cap_icon(n) for n in ("region", "window", "full", "quick")}
         self.nav_icons = {n: (nav_icon(n, MUTED), nav_icon(n, "#ffffff"))
@@ -1861,6 +1945,7 @@ class App:
         self.build_tools(self.pages["tools"])
         self.build_history(self.pages["hist"])
         self.build_settings(self.pages["cfg"])
+        self.update_estimate()
         self.show_page("home")
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -2080,6 +2165,13 @@ class App:
         RoundBtn(r, "Reduzir", command=lambda: self.start_job("discord"), kind="accent", bg=PANEL, padx=18, pady=6
                  ).pack(side="right")
 
+        c2b = self.card(p, "Otimizar (menor, quase sem perder qualidade)", pady=(px(8), 0))
+        r = tk.Frame(c2b, bg=PANEL)
+        r.pack(fill="x")
+        self.lbl(r, "Recodifica com mais cuidado; o arquivo costuma encolher bastante.").pack(side="left")
+        RoundBtn(r, "Otimizar", command=lambda: self.optimize(self.tool_file.get(), False), bg=PANEL, padx=18,
+                 pady=6).pack(side="right")
+
         c3 = self.card(p, "Cortar e exportar GIF", pady=(px(8), 0))
         c3.columnconfigure((1, 3), weight=1)
         self.lbl(c3, "Início").grid(row=0, column=0, sticky="w")
@@ -2158,19 +2250,25 @@ class App:
         self.form_row(c, 0, "Resolução", self.cmb(c, self.rec_res, list(RES_MAP), width=14))
         self.form_row(c, 1, "FPS", self.cmb(c, self.rec_fps, ["24", "30", "60"], width=14))
         self.form_row(c, 2, "Qualidade", self.cmb(c, self.rec_quality, QUALITY, width=24))
+        self.form_row(c, 3, "Codificador", self.cmb(c, self.enc_mode, ENC_MODES, width=34))
+        self.form_row(c, 4, "Modo de captura", self.cmb(c, self.cap_mode, CAP_MODES, width=34))
+        ro = tk.Frame(c, bg=PANEL)
+        Switch(ro, self.auto_opt, bg=PANEL).pack(side="left")
+        self.lbl(ro, "Otimizar depois de gravar (arquivo bem menor)", muted=False).pack(side="left", padx=px(8))
+        ro.grid(row=5, column=0, columnspan=2, sticky="w", pady=px(5))
+        tk.Label(c, textvariable=self.est_var, bg=PANEL, fg=ACCENT, font=("Segoe UI", 9), anchor="w",
+                 wraplength=px(480), justify="left").grid(row=6, column=0, columnspan=2, sticky="w", pady=(px(4), 0))
         rf = tk.Frame(c, bg=PANEL)
         RoundBtn(rf, "Alterar pasta…", command=lambda: self.pick_folder(self.vfolder), bg=PANEL, padx=12, pady=5,
                  font=("Segoe UI", 9, "bold")).pack(side="left")
-        self.form_row(c, 3, "Pasta dos vídeos", rf)
+        self.form_row(c, 7, "Pasta dos vídeos", rf)
         tk.Label(c, textvariable=self.vfolder, bg=PANEL, fg=MUTED, font=("Segoe UI", 9), anchor="w", wraplength=px(480),
-                 justify="left").grid(row=4, column=0, columnspan=2, sticky="w")
+                 justify="left").grid(row=8, column=0, columnspan=2, sticky="w")
         tk.Label(c, textvariable=self.enc_var, bg=PANEL, fg=FG, font=("Segoe UI", 9), anchor="w", wraplength=px(480),
-                 justify="left").grid(row=5, column=0, columnspan=2, sticky="w", pady=(px(8), 0))
+                 justify="left").grid(row=9, column=0, columnspan=2, sticky="w", pady=(px(8), 0))
         self.dl_btn = RoundBtn(c, "Baixar FFmpeg (necessário, ~90 MB)", command=self.download_ffmpeg, kind="accent",
                                bg=PANEL, padx=14, pady=7)
-        self.dl_btn.grid(row=6, column=0, columnspan=2, sticky="w", pady=(px(6), 0))
-        self.lbl(c, "Qualidade alta grava arquivos maiores. Para enviar no Discord, use a aba Ferramentas.").grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(px(8), 0))
+        self.dl_btn.grid(row=10, column=0, columnspan=2, sticky="w", pady=(px(6), 0))
 
         c = self.card(self.cfg_secs["audio"])
         self.mic_cb = self.cmb(c, self.rec_mic, ["Nenhum"] + self.mics, width=34)
@@ -2225,8 +2323,11 @@ class App:
                     "fps": self.rec_fps.get(), "quality": self.rec_quality.get(), "mic": self.rec_mic.get(),
                     "sys": self.rec_sys.get(), "hotkeys": self.hotkeys, "replay_len": self.replay_len.get(),
                     "close_tray": self.close_tray.get(), "history": self.history,
-                    "audio_offset_ms": self.get_offset(), "v": 4}
-            CONFIG.write_text(json.dumps(data), encoding="utf-8")
+                    "audio_offset_ms": self.get_offset(), "v": 5, "cap_mode": self.cap_mode.get(), "enc_mode": self.enc_mode.get(),
+                    "auto_opt": self.auto_opt.get()}
+            tmp = CONFIG.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, CONFIG)
         except Exception:
             pass
 
@@ -2349,7 +2450,7 @@ class App:
         item = self.history[idx]
         path = Path(item[0])
         if act == "open":
-            os.startfile(str(path))
+            open_path(path)
         elif act == "folder":
             self.open_folder(path)
         elif act == "copy":
@@ -2379,6 +2480,10 @@ class App:
             self.status.set("Atalho inválido: " + ", ".join(bad))
 
     def on_hotkey(self, k):
+        now = time.time()
+        if now - self._hk_last.get(k, 0) < 0.6:  # segurar a tecla não dispara várias vezes
+            return
+        self._hk_last[k] = now
         if k in ("region", "window", "full"):
             self.capture(k)
         elif k == "region_quick":
@@ -2512,12 +2617,48 @@ class App:
             self.dl_btn.grid()
 
     def _detect(self):
-        enc = detect_encoder(self.ffmpeg)
-        self.ui_queue.put(lambda: self.set_encoder(enc))
+        hw = detect_hw(self.ffmpeg)
+        self.ui_queue.put(lambda: self.set_hw(hw))
 
-    def set_encoder(self, enc):
-        self.encoder = enc
-        self.enc_var.set(f"Codificador: {ENC_LABEL[enc]}")
+    def set_hw(self, hw):
+        self.hw, self.encoder, self.hw_ready = hw, hw["encoder"], True
+        self.refresh_enc_label()
+
+    def pick_encoder(self):
+        """Automático: NVIDIA usa a placa; AMD/Intel integradas comprimem pior que o x264, então usa o processador."""
+        hw, mode = self.hw, self.enc_mode.get()
+        use_hw = hw["encoder"] != "libx264" and (
+            mode == ENC_MODES[2] or (mode == ENC_MODES[0] and hw["encoder"] == "h264_nvenc"))
+        if use_hw:
+            return hw["encoder"], hw["rich"], hw["gpu"]
+        return "libx264", True, False
+
+    def refresh_enc_label(self, *a):
+        if not self.hw_ready:
+            return
+        enc, rich, gpu_ok = self.pick_encoder()
+        direct = gpu_ok and self.cap_mode.get() == CAP_MODES[0]
+        self.enc_var.set(f"Em uso: {ENC_LABEL[enc]}\nDetectado neste PC: {ENC_LABEL[self.hw['encoder']]}\nCaptura: " +
+                         ("direta pela placa de vídeo (a mais leve)" if direct else "compatível (passa pelo processador)"))
+
+    def update_estimate(self, *a):
+        try:
+            tgt = self.rec_target.get()
+            if tgt in self.mon_map:
+                mon = self.mon_map[tgt][1]
+                o = {"kind": "monitor", "mon": mon, "area": None}
+            elif tgt == AREA_LABEL and self.area:
+                o = {"kind": "area", "mon": self.area[2], "area": self.area[0]}
+            else:
+                o = {"kind": "window", "mon": None, "area": None}
+            o["height"] = RES_MAP.get(self.rec_res.get(), 0)
+            fps, qi = int(self.rec_fps.get()), QUALITY.index(self.rec_quality.get())
+            w, h = out_dims(o)
+            mb = bitrate_cap(qi, w, h, fps) * 60 / 8 / 1024
+            self.est_var.set(f"Saída {w}x{h} a {fps} fps: no máximo ~{mb:.0f} MB por minuto "
+                             "(em tela parada ou jogo leve fica bem menor).")
+        except Exception:
+            self.est_var.set("")
 
     def download_ffmpeg(self):
         self.dl_btn.configure(state="disabled")
@@ -2584,10 +2725,29 @@ class App:
         use_audio = not self.audio_err
         mic = self.rec_mic.get() if use_audio and self.rec_mic.get() != "Nenhum" else ""
         spk = self.rec_sys.get() if use_audio and self.rec_sys.get() not in ("", "Nenhum") else ""
+        enc, rich, gpu_ok = self.pick_encoder()
+        height = RES_MAP.get(self.rec_res.get(), 0)
+        src_h = area[3] if kind == "area" else mon["height"]
+        gpu = bool(gpu_ok and self.cap_mode.get() == CAP_MODES[0] and kind in ("monitor", "area")
+                   and (height == 0 or height >= src_h))  # a captura direta não reduz resolução
         return {"ffmpeg": self.ffmpeg, "kind": kind, "mon": mon, "out_idx": idx, "area": area, "title": title,
-                "fps": int(self.rec_fps.get()), "height": RES_MAP.get(self.rec_res.get(), 0),
-                "quality": QUALITY.index(self.rec_quality.get()), "encoder": self.encoder or "libx264",
+                "fps": int(self.rec_fps.get()), "height": height, "quality": QUALITY.index(self.rec_quality.get()),
+                "encoder": enc, "rich": rich, "gpu": gpu,
                 "mic": mic, "spk": spk, "offset_ms": self.get_offset()}
+
+    def disk_ok(self):
+        try:
+            folder = Path(self.vfolder.get())
+            folder.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(folder).free
+        except Exception:
+            return True
+        if free < 300 * 1024 ** 2:
+            self.status.set(f"Pouco espaço no disco ({fmt_size(free)} livres). Libere espaço antes de gravar.")
+            return False
+        if free < 2 * 1024 ** 3:
+            self.status.set(f"Atenção: só {fmt_size(free)} livres no disco.")
+        return True
 
     # ------------------------------------------------------------ gravação
     def update_rec_ui(self):
@@ -2624,7 +2784,7 @@ class App:
 
     def start_record(self):
         opts = self.make_opts()
-        if not opts:
+        if not opts or not self.disk_ok():
             return
         try:
             Path(self.vfolder.get()).mkdir(parents=True, exist_ok=True)
@@ -2667,12 +2827,15 @@ class App:
             messagebox.showerror("Print HQ", err[-700:])
             return
         size = fmt_size(out.stat().st_size)
-        self.status.set(f"Vídeo salvo: {out.name} ({fmt_time(dur)}, {size})")
+        kbps = int(out.stat().st_size * 8 / max(1.0, dur) / 1000)
+        self.status.set(f"Vídeo salvo: {out.name} ({fmt_time(dur)}, {size}, média de {kbps} kbps)")
         self.add_history(out, "video")
         self.tool_file.set(str(out))
         show_toast(self.root, None, f"Gravação salva\n{fmt_time(dur)}  •  {size}",
-                   [("Abrir", lambda: os.startfile(str(out))), ("Pasta", lambda: self.open_folder(out)),
+                   [("Abrir", lambda: open_path(out)), ("Pasta", lambda: self.open_folder(out)),
                     ("p/ Discord", lambda: self.start_job("discord"))], seconds=10)
+        if self.auto_opt.get() and self.ffmpeg:
+            self.optimize(out, replace=True)
 
     def rec_failed(self, err):
         if self.rec.state in ("idle", "finalizing"):
@@ -2693,7 +2856,11 @@ class App:
         if r.state == "recording" and r.proc is not None and r.proc.poll() is not None \
                 and time.time() - r.seg_t0 > 3:
             self.ticking = False
-            self.rec_failed(r.tail_logs())
+            if r.size() > 2048:
+                self.status.set("A gravação parou sozinha. Salvando o que foi gravado…")
+                self.stop_record()
+            else:
+                self.rec_failed(r.tail_logs())
             return
         t, s = fmt_time(r.elapsed()), fmt_size(r.size())
         self.time_var.set(t)
@@ -2746,6 +2913,8 @@ class App:
             if not opts:
                 return
             secs = int(self.replay_len.get().split()[0])
+            if not self.disk_ok():
+                return
             try:
                 self.rec.start_replay(opts, secs)
             except Exception as ex:
@@ -2781,7 +2950,7 @@ class App:
         self.tool_file.set(str(out))
         self.status.set(f"Replay salvo: {out.name} ({fmt_size(out.stat().st_size)})")
         show_toast(self.root, None, f"Replay salvo\n{fmt_size(out.stat().st_size)}",
-                   [("Abrir", lambda: os.startfile(str(out))), ("Pasta", lambda: self.open_folder(out)),
+                   [("Abrir", lambda: open_path(out)), ("Pasta", lambda: self.open_folder(out)),
                     ("p/ Discord", lambda: self.start_job("discord"))], seconds=8)
 
     # ------------------------------------------------------------ ferramentas de vídeo
@@ -2817,7 +2986,7 @@ class App:
         except ValueError:
             self.status.set("Tempo inválido. Use mm:ss ou segundos.")
             return
-        precise, enc, qi = self.precise.get(), self.encoder or "libx264", QUALITY.index(self.rec_quality.get())
+        precise, (enc, rich, _), qi = self.precise.get(), self.pick_encoder(), QUALITY.index(self.rec_quality.get())
         self.job_running = True
         self.progress.configure(value=0)
         self.status.set("Processando…")
@@ -2835,7 +3004,7 @@ class App:
                     cmd = discord_cmd(ff, src, out, dur, mb)
                 elif kind == "trim":
                     out, total = src.with_name(src.stem + "_corte.mp4"), span
-                    cmd = trim_cmd(ff, src, out, s, span, precise, enc, qi)
+                    cmd = trim_cmd(ff, src, out, s, span, precise, enc, qi, rich)
                 else:
                     span = min(span, 30)
                     out, total = src.with_name(src.stem + ".gif"), span
@@ -2858,7 +3027,61 @@ class App:
         self.status.set(f"Pronto: {out.name} ({size})")
         self.add_history(out, "tool")
         show_toast(self.root, None, f"Pronto!\n{out.name}  •  {size}",
-                   [("Abrir", lambda: os.startfile(str(out))), ("Pasta", lambda: self.open_folder(out))], seconds=8)
+                   [("Abrir", lambda: open_path(out)), ("Pasta", lambda: self.open_folder(out))], seconds=8)
+
+    def optimize(self, src, replace=False):
+        """Recodifica com calma (prioridade baixa) para encolher o arquivo sem perda visível."""
+        src = Path(src) if src else None
+        if not self.ffmpeg:
+            self.status.set("Baixe o FFmpeg em Configurações > Vídeo.")
+            return
+        if not src or not src.is_file():
+            self.status.set("Escolha um vídeo na aba Ferramentas.")
+            return
+        if self.job_running:
+            self.status.set("Já existe uma tarefa em andamento.")
+            return
+        self.job_running = True
+        self.progress.configure(value=0)
+        qi = QUALITY.index(self.rec_quality.get())
+        out = src.with_name(src.stem + "_leve.mp4")
+        self.status.set("Otimizando o vídeo em segundo plano (pode usar o PC normalmente)…")
+
+        def work():
+            try:
+                dur = probe_duration(self.ffmpeg, src)
+                rc, err = run_job(optimize_cmd(self.ffmpeg, src, out, qi), dur, lambda p: self.ui_queue.put(
+                    lambda: (self.progress.configure(value=p), self.status.set(f"Otimizando… {int(p)}%"))), low=True)
+                if rc != 0 or not out.exists():
+                    raise RuntimeError(err[-300:] or "o FFmpeg falhou")
+                before, after = src.stat().st_size, out.stat().st_size
+                final = out
+                if replace:
+                    if after < before * 0.95:
+                        os.replace(out, src)
+                    else:
+                        out.unlink(missing_ok=True)
+                        after = before
+                    final = src
+                self.ui_queue.put(lambda: self.opt_done(final, before, after, replace, None))
+            except Exception as ex:
+                self.ui_queue.put(lambda ex=ex: self.opt_done(None, 0, 0, replace, str(ex)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def opt_done(self, final, before, after, replace, err):
+        self.job_running = False
+        if err:
+            self.status.set(f"Não consegui otimizar: {err}")
+            return
+        self.progress.configure(value=100)
+        pct = max(0, round((1 - after / before) * 100)) if before else 0
+        msg = f"Otimizado: {fmt_size(before)} → {fmt_size(after)} (-{pct}%)" if after < before else \
+            "O vídeo já estava bem compacto; mantive o original."
+        self.status.set(msg)
+        if not replace:
+            self.add_history(final, "tool")
+        show_toast(self.root, None, msg, [("Abrir", lambda: open_path(final)), ("Pasta", lambda: self.open_folder(final))],
+                   seconds=8)
 
     # ------------------------------------------------------------ atualização
     def check_update(self):
@@ -2897,9 +3120,30 @@ class App:
         self.root.mainloop()
 
 
+_MUTEX = None
+
+
+def already_running():
+    """Evita abrir o app duas vezes (os atalhos disparariam em dobro)."""
+    global _MUTEX
+    if sys.platform != "win32":
+        return False
+    try:
+        _MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "PrintHQ_single_instance")
+        return ctypes.windll.kernel32.GetLastError() == 183
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
     if "--make-icon" in sys.argv:  # usado pelo build_exe.bat
         make_icon(256).save("print_hq.ico", sizes=[(256, 256), (64, 64), (32, 32), (16, 16)])
+        sys.exit(0)
+    if already_running():
+        with contextlib.suppress(Exception):
+            r0 = tk.Tk()
+            r0.withdraw()
+            messagebox.showinfo("Print HQ", "O Print HQ já está aberto.\nProcure o ícone dele ao lado do relógio.")
         sys.exit(0)
     try:
         App().run()
