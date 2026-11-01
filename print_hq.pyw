@@ -1,5 +1,5 @@
 """
-Print HQ v4.2
+Print HQ v4.3
   Prints com editor embutido (setas, formas, texto, censura, marca-texto, numeração, OCR, fixar na tela)
   Gravação leve (FFmpeg) de monitor, janela ou área + replay dos últimos segundos
   Ferramentas: reduzir p/ Discord, cortar, GIF  |  Histórico  |  Ícone na bandeja  |  Atalhos editáveis
@@ -58,7 +58,7 @@ try:
 except Exception:
     winreg = None
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 UPDATE_URL = "https://raw.githubusercontent.com/antonioexpedito020-code/print-hq/main/print_hq.pyw"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 CONFIG = Path.home() / ".print_hq.json"
@@ -81,6 +81,7 @@ QUALITY = ["Leve (arquivo pequeno)", "Equilibrada", "Alta qualidade", "Máxima"]
 QV = {"libx264": [29, 25, 22, 18], "h264_nvenc": [31, 26, 22, 18], "h264_amf": [31, 26, 22, 18],
       "h264_qsv": [31, 26, 22, 18]}
 PROFILES = {  # (resolução, fps, qualidade)
+    "Mais leve para o PC - 1080p 30 fps": ("1080p", "30", QUALITY[1]),
     "Equilibrado - 1080p 60 fps": ("1080p", "60", QUALITY[1]),
     "Jogo - 1080p 60 fps, alta qualidade": ("1080p", "60", QUALITY[2]),
     "Tutorial - 1080p 30 fps, alta qualidade": ("1080p", "30", QUALITY[2]),
@@ -92,7 +93,7 @@ ENC_LABEL = {"h264_nvenc": "placa NVIDIA (NVENC) - leve para o PC", "h264_amf": 
              "h264_qsv": "Intel (QuickSync) - leve para o PC", "libx264": "processador (x264)"}
 WIN_LABEL, AREA_LABEL = "Uma janela específica", "Uma área da tela"
 CAP_MODES = ["Automático (recomendado)", "Compatível (usa mais o processador)"]
-ENC_MODES = ["Automático (menor arquivo)", "Processador (x264, menor arquivo)", "Placa de vídeo (mais leve para o PC)"]
+ENC_MODES = ["Automático (leve para o PC, otimiza depois)", "Processador (x264)", "Placa de vídeo"]
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
@@ -496,7 +497,7 @@ def find_ffmpeg():
     return str(local) if local.exists() else None
 
 
-BASE_CAP = [6000, 10000, 16000, 28000]  # kbps no limite, em 1080p a 60 fps (por qualidade)
+BASE_CAP = [8000, 14000, 22000, 36000]  # kbps no limite, em 1080p a 60 fps (por qualidade)
 
 
 def bitrate_cap(qi, w, h, fps):
@@ -530,12 +531,14 @@ def enc_args(enc, qi, fps, cap=None, rich=True):
             a += ["-tune", "hq", "-spatial-aq", "1", "-aq-strength", "8", "-rc-lookahead", "16", "-bf", "2"] + rate
         return a
     if enc == "h264_amf":
-        return ["-c:v", "h264_amf", "-quality", "quality" if rich else "balanced", "-rc", "cqp",
-                "-qp_i", str(q), "-qp_p", str(q + 2), "-g", g]
+        if rich:  # bitrate-alvo com pico: bem mais eficiente que CQP nesse codificador
+            return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "vbr_peak", "-b:v", f"{int(cap * 0.7)}k",
+                    "-maxrate", f"{cap}k", "-g", g]
+        return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q + 2), "-g", g]
     if enc == "h264_qsv":
         return ["-c:v", "h264_qsv", "-preset", "medium" if rich else "veryfast", "-global_quality", str(q), "-g", g]
-    preset = "faster" if qi < 2 else "fast"  # mais eficiente que "veryfast" (arquivo menor, um pouco mais de CPU)
-    return ["-c:v", "libx264", "-preset", preset, "-crf", str(q), "-profile:v", "high", "-g", g] + rate
+    # ao vivo o importante é não travar o jogo; o tamanho final fica por conta da otimização depois da gravação
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(q), "-profile:v", "high", "-g", g] + rate
 
 
 def _run_test(cmd, timeout):
@@ -561,14 +564,14 @@ def detect_hw(ff):
     return {"encoder": "libx264", "rich": True, "gpu": False}
 
 
-def video_filter(backend, height, pix):
+def video_filter(backend, height, pix, flags="fast_bilinear"):
     """Só reduz (nunca amplia) e garante largura/altura pares."""
     f = ["hwdownload", "format=bgra"] if backend == "ddagrab" else []
     if height:
         scale = f"scale=-2:trunc(min(ih\\,{height})/2)*2"
     else:
         scale = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
-    f.append(scale + ":flags=bicubic:out_color_matrix=bt709:out_range=tv")
+    f.append(scale + f":flags={flags}:out_color_matrix=bt709:out_range=tv")
     f.append(f"format={pix}")
     return ",".join(f)
 
@@ -757,11 +760,8 @@ class Recorder:
             self.segments.append(seg)
             cmd = build_cmd(o["ffmpeg"], o, seg, backend, audio, gpu=gpu)
         self.logf = open(self.tmp / f"log{n}.txt", "wb")
-        flags = NOWIN
-        if sys.platform == "win32" and o["encoder"] == "libx264":
-            flags |= 0x4000  # prioridade menor: o jogo continua com os núcleos do processador
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                     stderr=self.logf, creationflags=flags)
+                                     stderr=self.logf, creationflags=NOWIN)
         self.feeder = None
         if audio:
             self.feeder = AudioFeeder(self.proc.stdin, o["mic"], o["spk"], o.get("offset_ms", 0))
@@ -939,11 +939,25 @@ def gif_cmd(ff, src, out, start, span, width, fps):
     return [ff, "-y", "-ss", f"{start:.3f}", "-t", f"{span:.3f}", "-i", str(src), "-vf", vf, "-loop", "0", str(out)]
 
 
-def optimize_cmd(ff, src, out, qi):
+def optimize_cmd(ff, src, out, qi, height=0):
     crf = [31, 27, 24, 20][qi]  # um pouco acima do da gravação: aqui o objetivo é encolher
-    return [ff, "-y", "-i", str(src), "-c:v", "libx264", "-preset", "slow", "-crf", str(crf), "-g", "600",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "copy", "-movflags", "+faststart", str(out)]
+    cmd = [ff, "-y", "-i", str(src)]
+    if height:  # reduz a resolução com calma (alta qualidade), já que o jogo não está mais rodando
+        cmd += ["-vf", f"scale=-2:trunc(min(ih\\,{height})/2)*2:flags=lanczos"]
+    return cmd + ["-c:v", "libx264", "-preset", "slow", "-crf", str(crf), "-g", "600", "-pix_fmt", "yuv420p",
+                  "-c:a", "copy", "-movflags", "+faststart", str(out)]
+
+
+def count_frames(ff, path):
+    """Quantos quadros de vídeo o arquivo tem de verdade (mede se a gravação acompanhou o FPS)."""
+    try:
+        r = subprocess.run([ff, "-hide_banner", "-an", "-i", str(path), "-map", "0:v:0", "-fps_mode", "passthrough",
+                            "-f", "null", "-"], capture_output=True, timeout=180,
+                           creationflags=NOWIN | (0x4000 if sys.platform == "win32" else 0))
+        m = re.findall(r"frame=\s*(\d+)", r.stderr.decode(errors="ignore"))
+        return int(m[-1]) if m else 0
+    except Exception:
+        return 0
 
 
 def run_job(cmd, total, on_progress, low=False):
@@ -1873,7 +1887,10 @@ class App:
         self.replay_len = V("replay_len", "30 s")
         self.cap_mode = V("cap_mode", CAP_MODES[0])
         self.enc_mode = V("enc_mode", ENC_MODES[0])
-        self.auto_opt = tk.BooleanVar(value=cfg.get("auto_opt", True) if cfg.get("v") == 5 else True)
+        if cfg.get("v") != 6 or self.enc_mode.get() not in ENC_MODES:
+            self.enc_mode.set(ENC_MODES[0])  # versões anteriores escolhiam o processador e travavam o jogo
+        self.auto_opt = tk.BooleanVar(value=cfg.get("auto_opt", True) if cfg.get("v") == 6 else True)
+        self.post_height = 0
         self.est_var = tk.StringVar(value="")
         self.hw, self.hw_ready, self._hk_last = {"encoder": "libx264", "rich": True, "gpu": False}, False, {}
         self.replay_var = tk.BooleanVar(value=False)
@@ -2323,7 +2340,7 @@ class App:
                     "fps": self.rec_fps.get(), "quality": self.rec_quality.get(), "mic": self.rec_mic.get(),
                     "sys": self.rec_sys.get(), "hotkeys": self.hotkeys, "replay_len": self.replay_len.get(),
                     "close_tray": self.close_tray.get(), "history": self.history,
-                    "audio_offset_ms": self.get_offset(), "v": 5, "cap_mode": self.cap_mode.get(), "enc_mode": self.enc_mode.get(),
+                    "audio_offset_ms": self.get_offset(), "v": 6, "cap_mode": self.cap_mode.get(), "enc_mode": self.enc_mode.get(),
                     "auto_opt": self.auto_opt.get()}
             tmp = CONFIG.with_suffix(".tmp")
             tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -2625,11 +2642,10 @@ class App:
         self.refresh_enc_label()
 
     def pick_encoder(self):
-        """Automático: NVIDIA usa a placa; AMD/Intel integradas comprimem pior que o x264, então usa o processador."""
+        """Automático: usa a placa/vídeo integrado quando existe (não rouba CPU do jogo); o tamanho final
+        vem da otimização depois da gravação."""
         hw, mode = self.hw, self.enc_mode.get()
-        use_hw = hw["encoder"] != "libx264" and (
-            mode == ENC_MODES[2] or (mode == ENC_MODES[0] and hw["encoder"] == "h264_nvenc"))
-        if use_hw:
+        if hw["encoder"] != "libx264" and mode != ENC_MODES[1]:
             return hw["encoder"], hw["rich"], hw["gpu"]
         return "libx264", True, False
 
@@ -2656,7 +2672,7 @@ class App:
             w, h = out_dims(o)
             mb = bitrate_cap(qi, w, h, fps) * 60 / 8 / 1024
             self.est_var.set(f"Saída {w}x{h} a {fps} fps: no máximo ~{mb:.0f} MB por minuto "
-                             "(em tela parada ou jogo leve fica bem menor).")
+                             "durante a gravação; ao terminar, a otimização encolhe o arquivo.")
         except Exception:
             self.est_var.set("")
 
@@ -2728,10 +2744,12 @@ class App:
         enc, rich, gpu_ok = self.pick_encoder()
         height = RES_MAP.get(self.rec_res.get(), 0)
         src_h = area[3] if kind == "area" else mon["height"]
-        gpu = bool(gpu_ok and self.cap_mode.get() == CAP_MODES[0] and kind in ("monitor", "area")
-                   and (height == 0 or height >= src_h))  # a captura direta não reduz resolução
+        gpu = bool(gpu_ok and self.cap_mode.get() == CAP_MODES[0] and kind in ("monitor", "area"))
+        post_h = 0
+        if gpu and height and height < src_h:  # a captura direta não reduz: grava na resolução da tela e reduz depois
+            post_h, height = height, 0
         return {"ffmpeg": self.ffmpeg, "kind": kind, "mon": mon, "out_idx": idx, "area": area, "title": title,
-                "fps": int(self.rec_fps.get()), "height": height, "quality": QUALITY.index(self.rec_quality.get()),
+                "fps": int(self.rec_fps.get()), "height": height, "post_height": post_h, "quality": QUALITY.index(self.rec_quality.get()),
                 "encoder": enc, "rich": rich, "gpu": gpu,
                 "mic": mic, "spk": spk, "offset_ms": self.get_offset()}
 
@@ -2786,6 +2804,7 @@ class App:
         opts = self.make_opts()
         if not opts or not self.disk_ok():
             return
+        self.post_height = opts["post_height"]
         try:
             Path(self.vfolder.get()).mkdir(parents=True, exist_ok=True)
             self.rec.start(opts)
@@ -2811,12 +2830,13 @@ class App:
         def work():
             try:
                 self.rec.finalize(was, out)
-                self.ui_queue.put(lambda: self.rec_done(out, dur, None))
+                frames = count_frames(self.ffmpeg, out)
+                self.ui_queue.put(lambda: self.rec_done(out, dur, None, frames))
             except Exception as ex:
                 self.ui_queue.put(lambda ex=ex: self.rec_done(None, dur, str(ex)))
         threading.Thread(target=work, daemon=True).start()
 
-    def rec_done(self, out, dur, err):
+    def rec_done(self, out, dur, err, frames=0):
         self.rec.state = "idle"
         self.close_minibar()
         if self.root.state() == "iconic":
@@ -2828,14 +2848,24 @@ class App:
             return
         size = fmt_size(out.stat().st_size)
         kbps = int(out.stat().st_size * 8 / max(1.0, dur) / 1000)
-        self.status.set(f"Vídeo salvo: {out.name} ({fmt_time(dur)}, {size}, média de {kbps} kbps)")
+        msg = f"Vídeo salvo: {out.name} ({fmt_time(dur)}, {size}, média de {kbps} kbps)"
+        try:
+            target = int(self.rec_fps.get())
+        except ValueError:
+            target = 60
+        real = frames / dur if dur > 1 and frames else 0
+        if real:
+            msg += f" • {real:.0f} fps reais"
+            if real < target * 0.9:
+                msg += f" (abaixo dos {target} fps pedidos: tente 30 fps)"
+        self.status.set(msg)
         self.add_history(out, "video")
         self.tool_file.set(str(out))
         show_toast(self.root, None, f"Gravação salva\n{fmt_time(dur)}  •  {size}",
                    [("Abrir", lambda: open_path(out)), ("Pasta", lambda: self.open_folder(out)),
                     ("p/ Discord", lambda: self.start_job("discord"))], seconds=10)
-        if self.auto_opt.get() and self.ffmpeg:
-            self.optimize(out, replace=True)
+        if self.ffmpeg and (self.post_height or self.auto_opt.get()):
+            self.optimize(out, replace=True, height=self.post_height, force=bool(self.post_height))
 
     def rec_failed(self, err):
         if self.rec.state in ("idle", "finalizing"):
@@ -2915,6 +2945,7 @@ class App:
             secs = int(self.replay_len.get().split()[0])
             if not self.disk_ok():
                 return
+            self.post_height = opts["post_height"]
             try:
                 self.rec.start_replay(opts, secs)
             except Exception as ex:
@@ -2948,6 +2979,8 @@ class App:
             return
         self.add_history(out, "replay")
         self.tool_file.set(str(out))
+        if self.post_height and self.ffmpeg:
+            self.optimize(out, replace=True, height=self.post_height, force=True)
         self.status.set(f"Replay salvo: {out.name} ({fmt_size(out.stat().st_size)})")
         show_toast(self.root, None, f"Replay salvo\n{fmt_size(out.stat().st_size)}",
                    [("Abrir", lambda: open_path(out)), ("Pasta", lambda: self.open_folder(out)),
@@ -3029,7 +3062,7 @@ class App:
         show_toast(self.root, None, f"Pronto!\n{out.name}  •  {size}",
                    [("Abrir", lambda: open_path(out)), ("Pasta", lambda: self.open_folder(out))], seconds=8)
 
-    def optimize(self, src, replace=False):
+    def optimize(self, src, replace=False, height=0, force=False):
         """Recodifica com calma (prioridade baixa) para encolher o arquivo sem perda visível."""
         src = Path(src) if src else None
         if not self.ffmpeg:
@@ -3045,19 +3078,20 @@ class App:
         self.progress.configure(value=0)
         qi = QUALITY.index(self.rec_quality.get())
         out = src.with_name(src.stem + "_leve.mp4")
-        self.status.set("Otimizando o vídeo em segundo plano (pode usar o PC normalmente)…")
+        self.status.set("Otimizando o vídeo em segundo plano (pode usar o PC normalmente)…" if not height else
+                        f"Convertendo para {height}p e otimizando (pode usar o PC normalmente)…")
 
         def work():
             try:
                 dur = probe_duration(self.ffmpeg, src)
-                rc, err = run_job(optimize_cmd(self.ffmpeg, src, out, qi), dur, lambda p: self.ui_queue.put(
+                rc, err = run_job(optimize_cmd(self.ffmpeg, src, out, qi, height), dur, lambda p: self.ui_queue.put(
                     lambda: (self.progress.configure(value=p), self.status.set(f"Otimizando… {int(p)}%"))), low=True)
                 if rc != 0 or not out.exists():
                     raise RuntimeError(err[-300:] or "o FFmpeg falhou")
                 before, after = src.stat().st_size, out.stat().st_size
                 final = out
                 if replace:
-                    if after < before * 0.95:
+                    if force or after < before * 0.95:
                         os.replace(out, src)
                     else:
                         out.unlink(missing_ok=True)
