@@ -1,5 +1,5 @@
 """
-Print HQ v4.3
+Print HQ v4.4
   Prints com editor embutido (setas, formas, texto, censura, marca-texto, numeração, OCR, fixar na tela)
   Gravação leve (FFmpeg) de monitor, janela ou área + replay dos últimos segundos
   Ferramentas: reduzir p/ Discord, cortar, GIF  |  Histórico  |  Ícone na bandeja  |  Atalhos editáveis
@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import copy
 import ctypes
+import platform
 import ctypes.wintypes
 import io
 import json
@@ -58,7 +59,7 @@ try:
 except Exception:
     winreg = None
 
-VERSION = "4.3.0"
+VERSION = "4.4.0"
 UPDATE_URL = "https://raw.githubusercontent.com/antonioexpedito020-code/print-hq/main/print_hq.pyw"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 CONFIG = Path.home() / ".print_hq.json"
@@ -92,6 +93,9 @@ PROFILES = {  # (resolução, fps, qualidade)
 ENC_LABEL = {"h264_nvenc": "placa NVIDIA (NVENC) - leve para o PC", "h264_amf": "placa AMD (AMF) - leve para o PC",
              "h264_qsv": "Intel (QuickSync) - leve para o PC", "libx264": "processador (x264)"}
 WIN_LABEL, AREA_LABEL = "Uma janela específica", "Uma área da tela"
+STAGE_NAMES = {("ddagrab", True): "captura direta pela placa de vídeo",
+               ("ddagrab", False): "captura compatível (passa pelo processador)",
+               ("gdigrab", False): "captura alternativa (gdigrab)"}
 CAP_MODES = ["Automático (recomendado)", "Compatível (usa mais o processador)"]
 ENC_MODES = ["Automático (leve para o PC, otimiza depois)", "Processador (x264)", "Placa de vídeo"]
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -549,19 +553,42 @@ def _run_test(cmd, timeout):
 
 
 def detect_hw(ff):
-    """Testa de verdade o que este PC suporta: codificador da placa, ajustes extras e captura direta na GPU."""
+    """Testa de verdade o que este PC suporta e guarda o resultado (e o erro) de cada teste."""
     base = [ff, "-hide_banner", "-loglevel", "error"]
+    log = []
+
+    def run(name, cmd, timeout):
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=NOWIN)
+            ok = r.returncode == 0
+            log.append((name, ok, r.stderr.decode(errors="ignore").strip()[-500:]))
+            return ok
+        except Exception as ex:
+            log.append((name, False, str(ex)))
+            return False
+
+    def src_test(enc, rich):
+        return base + ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30", "-frames:v", "10",
+                       "-vf", "format=nv12"] + enc_args(enc, 1, 30, 8000, rich) + ["-f", "null", "-"]
+
+    res = {"encoder": "libx264", "rich": True, "gpu": False, "gpu_vf": None, "log": log}
     for enc in ("h264_nvenc", "h264_amf", "h264_qsv"):
-        def enc_test(rich, enc=enc):
-            return _run_test(base + ["-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30", "-frames:v", "10",
-                                     "-vf", "format=nv12"] + enc_args(enc, 1, 30, 8000, rich) + ["-f", "null", "-"], 30)
-        if enc_test(False):
-            rich = enc_test(True)
-            gpu = enc in ("h264_nvenc", "h264_amf") and _run_test(
-                base + ["-f", "lavfi", "-i", "ddagrab=output_idx=0:framerate=30", "-frames:v", "12"]
-                + enc_args(enc, 1, 30, 8000, rich) + ["-f", "null", "-"], 40)
-            return {"encoder": enc, "rich": rich, "gpu": gpu}
-    return {"encoder": "libx264", "rich": True, "gpu": False}
+        if not run(f"{enc} (básico)", src_test(enc, False), 30):
+            continue
+        rich = run(f"{enc} (avançado)", src_test(enc, True), 30)
+        res.update(encoder=enc, rich=rich)
+        if enc in ("h264_nvenc", "h264_amf"):
+            for name, vf in (("direta", None), ("direta + scale_d3d11", "scale_d3d11=format=nv12")):
+                cmd = base + ["-f", "lavfi", "-i", "ddagrab=output_idx=0:framerate=30", "-frames:v", "12"]
+                cmd += (["-vf", vf] if vf else []) + enc_args(enc, 1, 30, 8000, rich) + ["-f", "null", "-"]
+                if run(f"captura {name} com {enc}", cmd, 40):
+                    res.update(gpu=True, gpu_vf=vf)
+                    break
+        break
+    run("captura ddagrab pelo processador (x264)", base + ["-f", "lavfi", "-i", "ddagrab=output_idx=0:framerate=30",
+                                                             "-frames:v", "12", "-vf", "hwdownload,format=bgra,format=yuv420p",
+                                                             "-c:v", "libx264", "-preset", "ultrafast", "-f", "null", "-"], 40)
+    return res
 
 
 def video_filter(backend, height, pix, flags="fast_bilinear"):
@@ -597,7 +624,10 @@ def build_cmd(ff, o, out, backend, audio, replay_wrap=None, gpu=False):
                 "-offset_y", str(ay), "-video_size", f"{aw}x{ah}", "-i", "desktop"]
     if audio:
         cmd += ["-thread_queue_size", "1024", "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "pipe:0"]
-    if not (gpu and backend == "ddagrab"):
+    if gpu and backend == "ddagrab":
+        if o.get("gpu_vf"):
+            cmd += ["-vf", o["gpu_vf"]]
+    else:
         pix = "yuv420p" if o["encoder"] == "libx264" else "nv12"
         cmd += ["-vf", video_filter("gdigrab" if kind == "window" else backend, o["height"], pix)]
     ow, oh = out_dims(o)
@@ -636,18 +666,32 @@ class AudioFeeder(threading.Thread):
         self.stdin, self.mic, self.spk, self.offset_ms = stdin, mic, spk, offset_ms
         self.stop_ev = threading.Event()
         self.error = None
+        self.t0, self.written = None, 0
 
     def stop(self):
         self.stop_ev.set()
+
+    def _pad_to_clock(self, final=False):
+        """Se o PC engasgou e perdeu áudio, completa com silêncio: o som continua do tamanho do vídeo."""
+        if self.t0 is None:
+            return
+        want = int((time.time() - self.t0) * self.RATE) - self.written
+        if want > self.RATE * (0.0 if final else 0.15):
+            self.stdin.write(b"\x00" * (want * 8))  # estéreo float32 = 8 bytes por amostra
+            self.written += want
 
     def run(self):
         try:
             with contextlib.suppress(Exception):
                 import pythoncom
                 pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            self.t0 = time.time()
             if self.offset_ms > 0:
-                self.stdin.write(b"\x00" * (int(self.RATE * self.offset_ms / 1000) * 8))
+                n = int(self.RATE * self.offset_ms / 1000)
+                self.stdin.write(b"\x00" * (n * 8))
+                self.written += n
             self._record()
+            self._pad_to_clock(final=True)
         except Exception as ex:
             self.error = str(ex)
             self._silence()  # mantém o vídeo gravando mesmo se o áudio falhar
@@ -681,8 +725,11 @@ class AudioFeeder(threading.Thread):
                     mix = d if mix is None else mix + d
                 if skip > 0:
                     skip -= 1
+                    self.t0 += self.BLOCK / self.RATE  # som descartado de propósito (ajuste negativo)
                     continue
                 self.stdin.write(np.clip(mix, -1, 1).astype("<f4").tobytes())
+                self.written += self.BLOCK
+                self._pad_to_clock()
                 self.stdin.flush()
 
     def _silence(self):
@@ -710,6 +757,7 @@ class Recorder:
         self.segments, self.acc, self.seg_t0 = [], 0.0, 0.0
         self.opts, self.tmp = None, None
         self.stages, self.stage_i = [], 0
+        self.last_cmd, self.last_stage = [], None
         self.replay_secs = 30
 
     def elapsed(self):
@@ -725,7 +773,11 @@ class Recorder:
     def _stages(self, opts):
         if opts["kind"] == "window":
             return [("gdigrab", False)]
-        return ([("ddagrab", True)] if opts.get("gpu") else []) + [("ddagrab", False), ("gdigrab", False)]
+        st = ([("ddagrab", True)] if opts.get("gpu") else []) + [("ddagrab", False), ("gdigrab", False)]
+        pref = opts.get("stage_pref")
+        if pref and tuple(pref) in st:  # etapa que o "Testar desempenho" mostrou que acompanha o FPS
+            st = st[st.index(tuple(pref)):]
+        return st
 
     def start(self, opts):
         self.mode, self.opts = "record", opts
@@ -759,6 +811,7 @@ class Recorder:
             seg = self.tmp / f"seg{n:03d}.mkv"
             self.segments.append(seg)
             cmd = build_cmd(o["ffmpeg"], o, seg, backend, audio, gpu=gpu)
+        self.last_cmd, self.last_stage = cmd, (backend, gpu)
         self.logf = open(self.tmp / f"log{n}.txt", "wb")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                      stderr=self.logf, creationflags=NOWIN)
@@ -853,6 +906,11 @@ class Recorder:
         if not segs:
             raise RuntimeError("Nenhum vídeo foi gravado. " + self.tail_logs())
         self._concat(ff, segs, out)
+        with contextlib.suppress(Exception):  # fica disponível para o Diagnóstico
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            (APP_DIR / "ultima_gravacao.txt").write_text(
+                f"ETAPA: {self.last_stage}\nCOMANDO:\n{' '.join(map(str, self.last_cmd))}\n\nLOG DO FFMPEG:\n{self.tail_logs()}\n",
+                encoding="utf-8")
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _concat(self, ff, files, out):
@@ -1656,7 +1714,7 @@ class RoundBtn(tk.Canvas):
             w, h = int(float(self.cget("width"))), int(float(self.cget("height")))
         fill, hov, fg = self.KINDS[self.kind]
         if self.st == "disabled":
-            fill, fg = ("#2a2c30" if fill else None), "#6b6f76"
+            fill, fg = ("#34373c" if fill else None), "#6b6f76"
         elif self.hover:
             fill = hov
         if fill:
@@ -1894,10 +1952,13 @@ class App:
         self.est_var = tk.StringVar(value="")
         self.hw, self.hw_ready, self._hk_last = {"encoder": "libx264", "rich": True, "gpu": False}, False, {}
         self.replay_var = tk.BooleanVar(value=False)
+        self.replay_text = tk.StringVar(value="Desligado")
         self.close_tray = tk.BooleanVar(value=cfg.get("close_tray", True))
         self.autostart = tk.BooleanVar(value=get_autostart())
         self.precise = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="Pronto.")
+        self._st_job = None
+        self.status.trace_add("write", self._status_changed)
         self.time_var = tk.StringVar(value="00:00:00")
         self.size_var = tk.StringVar(value="0.0 MB")
         self.enc_var = tk.StringVar(value="")
@@ -1910,6 +1971,11 @@ class App:
         self.mon_list = list_monitors()
         self.mon_map = {f"Monitor {i + 1}  ({m['width']}x{m['height']})": (i, m) for i, m in enumerate(self.mon_list)}
         self.targets = list(self.mon_map) + [WIN_LABEL, AREA_LABEL]
+        self.screen_h = max((m["height"] for m in self.mon_list), default=1080)
+        self.res_values = [k for k, v in RES_MAP.items() if v == 0 or v <= self.screen_h]
+        if self.rec_res.get() not in self.res_values:
+            self.rec_res.set("1080p" if "1080p" in self.res_values else "Original")
+        self.sync_profile()
         if self.rec_target.get() not in self.targets:
             self.rec_target.set(self.targets[0])
         mics, spks, default, err = list_audio()
@@ -1976,6 +2042,13 @@ class App:
         self.refresh_ffmpeg_state()
         self.root.after(50, self.pump)
         self.root.after(400, lambda: exclude_from_capture(self.root))
+
+    def _status_changed(self, *a):
+        if self._st_job:
+            self.root.after_cancel(self._st_job)
+            self._st_job = None
+        if self.status.get() != "Pronto.":
+            self._st_job = self.root.after(45000, lambda: self.status.set("Pronto."))
 
     def on_ui_error(self, exc, val, tb):
         import traceback
@@ -2087,13 +2160,17 @@ class App:
         self.pause_btn = RoundBtn(card, "Pausar", command=self.toggle_pause, bg=PANEL, pady=10)
         self.pause_btn.grid(row=4, column=1, sticky="ew", padx=(px(8), 0), pady=(px(6), 0))
         self.pause_btn.configure(state="disabled")
+        RoundBtn(card, "Testar desempenho (10 s)", command=self.perf_test, kind="ghost", bg=PANEL,
+                 font=("Segoe UI", 9), padx=10, pady=4).grid(row=5, column=0, columnspan=2, sticky="w",
+                                                              pady=(px(6), 0))
         self.on_target_change()
 
         card2 = self.card(p, "Replay (guarda só os últimos segundos)", pady=(px(10), 0))
         r2 = tk.Frame(card2, bg=PANEL)
         r2.pack(fill="x")
         Switch(r2, self.replay_var, command=self.toggle_replay, bg=PANEL).pack(side="left")
-        tk.Label(r2, text="Ligado", bg=PANEL, fg=FG, font=("Segoe UI", 10)).pack(side="left", padx=(px(8), px(14)))
+        tk.Label(r2, textvariable=self.replay_text, bg=PANEL, fg=FG, font=("Segoe UI", 10), width=10, anchor="w"
+                 ).pack(side="left", padx=(px(8), px(8)))
         self.cmb(r2, self.replay_len, ["15 s", "30 s", "60 s", "120 s"], width=7).pack(side="left")
         self.replay_save_btn = RoundBtn(r2, "Salvar agora", command=self.save_replay, bg=PANEL, padx=14, pady=6)
         self.replay_save_btn.pack(side="right")
@@ -2264,7 +2341,7 @@ class App:
             row=5, column=0, columnspan=2, sticky="w", pady=(px(8), 0))
 
         c = self.card(self.cfg_secs["video"])
-        self.form_row(c, 0, "Resolução", self.cmb(c, self.rec_res, list(RES_MAP), width=14))
+        self.form_row(c, 0, "Resolução", self.cmb(c, self.rec_res, self.res_values, width=14))
         self.form_row(c, 1, "FPS", self.cmb(c, self.rec_fps, ["24", "30", "60"], width=14))
         self.form_row(c, 2, "Qualidade", self.cmb(c, self.rec_quality, QUALITY, width=24))
         self.form_row(c, 3, "Codificador", self.cmb(c, self.enc_mode, ENC_MODES, width=34))
@@ -2286,10 +2363,12 @@ class App:
         self.dl_btn = RoundBtn(c, "Baixar FFmpeg (necessário, ~90 MB)", command=self.download_ffmpeg, kind="accent",
                                bg=PANEL, padx=14, pady=7)
         self.dl_btn.grid(row=10, column=0, columnspan=2, sticky="w", pady=(px(6), 0))
+        self.lbl(c, f"Seu monitor tem {self.screen_h}p: resoluções maiores que isso não melhorariam a imagem.").grid(
+            row=11, column=0, columnspan=2, sticky="w", pady=(px(6), 0))
 
         c = self.card(self.cfg_secs["audio"])
-        self.mic_cb = self.cmb(c, self.rec_mic, ["Nenhum"] + self.mics, width=34)
-        self.sys_cb = self.cmb(c, self.rec_sys, ["Nenhum"] + self.spks, width=34)
+        self.mic_cb = self.cmb(c, self.rec_mic, ["Nenhum"] + self.mics, width=46)
+        self.sys_cb = self.cmb(c, self.rec_sys, ["Nenhum"] + self.spks, width=46)
         self.form_row(c, 0, "Microfone", self.mic_cb)
         self.form_row(c, 1, "Áudio do computador", self.sys_cb)
         self.form_row(c, 2, "Ajuste de sincronia (ms)", ttk.Spinbox(c, from_=-500, to=1000, increment=50,
@@ -2326,6 +2405,8 @@ class App:
         self.lbl(r, "Fechar a janela (X) mantém o app na bandeja", muted=False).pack(side="left", padx=px(10))
         RoundBtn(c, f"Verificar atualização (v{VERSION})", command=self.check_update, bg=PANEL, padx=14, pady=7
                  ).pack(anchor="w", pady=(px(10), 0))
+        RoundBtn(c, "Diagnóstico (relatório para enviar ao suporte)", command=self.run_diagnostic, bg=PANEL, padx=14,
+                 pady=7).pack(anchor="w", pady=(px(6), 0))
         self.show_cfg_section("prints")
         seg.select("prints")
 
@@ -2340,7 +2421,7 @@ class App:
                     "fps": self.rec_fps.get(), "quality": self.rec_quality.get(), "mic": self.rec_mic.get(),
                     "sys": self.rec_sys.get(), "hotkeys": self.hotkeys, "replay_len": self.replay_len.get(),
                     "close_tray": self.close_tray.get(), "history": self.history,
-                    "audio_offset_ms": self.get_offset(), "v": 6, "cap_mode": self.cap_mode.get(), "enc_mode": self.enc_mode.get(),
+                    "audio_offset_ms": self.get_offset(), "v": 6, "cap_mode": self.cap_mode.get(), "enc_mode": self.enc_mode.get(), "stage_pref": self.cfg.get("stage_pref"),
                     "auto_opt": self.auto_opt.get()}
             tmp = CONFIG.with_suffix(".tmp")
             tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -2750,7 +2831,8 @@ class App:
             post_h, height = height, 0
         return {"ffmpeg": self.ffmpeg, "kind": kind, "mon": mon, "out_idx": idx, "area": area, "title": title,
                 "fps": int(self.rec_fps.get()), "height": height, "post_height": post_h, "quality": QUALITY.index(self.rec_quality.get()),
-                "encoder": enc, "rich": rich, "gpu": gpu,
+                "encoder": enc, "rich": rich, "gpu": gpu, "gpu_vf": self.hw.get("gpu_vf") if enc != "libx264" else None,
+                "stage_pref": self.cfg.get("stage_pref"),
                 "mic": mic, "spk": spk, "offset_ms": self.get_offset()}
 
     def disk_ok(self):
@@ -2775,6 +2857,7 @@ class App:
                                state="disabled" if st in ("finalizing", "replay") else "normal")
         self.pause_btn.configure(text="Retomar" if st == "paused" else "Pausar", state="normal" if busy else "disabled")
         self.replay_var.set(st == "replay")
+        self.replay_text.set("Ligado" if st == "replay" else "Desligado")
         self.replay_save_btn.configure(state="normal" if st == "replay" else "disabled")
         if self.minibar and hasattr(self, "mb_pause"):
             with contextlib.suppress(tk.TclError):
@@ -3056,11 +3139,140 @@ class App:
             self.status.set(f"Falhou: {err}")
             return
         self.progress.configure(value=100)
+        self.root.after(4000, lambda: self.progress.configure(value=0))
         size = fmt_size(out.stat().st_size)
         self.status.set(f"Pronto: {out.name} ({size})")
         self.add_history(out, "tool")
         show_toast(self.root, None, f"Pronto!\n{out.name}  •  {size}",
                    [("Abrir", lambda: open_path(out)), ("Pasta", lambda: self.open_folder(out))], seconds=8)
+
+    def run_diagnostic(self):
+        if not self.ffmpeg:
+            self.status.set("Baixe o FFmpeg primeiro (Configurações > Vídeo).")
+            return
+        self.status.set("Gerando o diagnóstico (leva uns 20 segundos)…")
+
+        def work():
+            try:
+                text, hw = self.build_report()
+            except Exception as ex:
+                text, hw = f"Falha ao gerar o diagnóstico: {ex}", None
+            self.ui_queue.put(lambda: self.show_report(text, hw))
+        threading.Thread(target=work, daemon=True).start()
+
+    def build_report(self):
+        ff = self.ffmpeg
+
+        def out(args):
+            try:
+                r = subprocess.run([ff, "-hide_banner"] + args, capture_output=True, timeout=30, creationflags=NOWIN)
+                return (r.stdout + r.stderr).decode(errors="ignore")
+            except Exception as ex:
+                return str(ex)
+        ver = out(["-version"]).splitlines()[:1]
+        L = [f"Print HQ v{VERSION}", f"Windows: {platform.platform()}", f"Python: {sys.version.split()[0]}",
+             f"Processador: {platform.processor()}",
+             "Tela(s): " + ", ".join(f"{m['width']}x{m['height']}" for m in self.mon_list), "",
+             "FFmpeg: " + (ver[0] if ver else "?"),
+             "Codificadores H.264: " + ", ".join(sorted(set(re.findall(r"h264_\w+|libx264", out(["-encoders"]))))),
+             "Filtros: " + ", ".join(n for n in ("ddagrab", "gfxcapture", "scale_d3d11", "hwdownload")
+                                     if re.search(rf"\b{n}\b", out(["-filters"]))), "", "TESTES NESTE PC:"]
+        hw = detect_hw(ff)
+        for name, ok, err in hw["log"]:
+            L.append(f"  [{'OK' if ok else 'FALHOU'}] {name}" + (f"\n      {err}" if err and not ok else ""))
+        L += ["", f"Resultado: codificador={hw['encoder']} avançado={hw['rich']} captura direta={hw['gpu']} "
+                  f"filtro={hw['gpu_vf']}", "", "AJUSTES:",
+              f"  resolução={self.rec_res.get()} fps={self.rec_fps.get()} qualidade={self.rec_quality.get()}",
+              f"  codificador={self.enc_mode.get()} | captura={self.cap_mode.get()} | otimizar={self.auto_opt.get()}",
+              f"  áudio: mic={self.rec_mic.get()} | pc={self.rec_sys.get()} | sincronia={self.get_offset()} ms",
+              f"  etapa preferida: {self.cfg.get('stage_pref')}"]
+        last = APP_DIR / "ultima_gravacao.txt"
+        if last.exists():
+            L += ["", "ÚLTIMA GRAVAÇÃO:", last.read_text(errors="ignore")[-2500:]]
+        return "\n".join(L), hw
+
+    def show_report(self, text, hw):
+        if hw:
+            self.set_hw(hw)
+        with contextlib.suppress(Exception):
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            (APP_DIR / "diagnostico.txt").write_text(text, encoding="utf-8")
+        self.status.set("Diagnóstico pronto. Clique em “Copiar tudo” e cole na conversa.")
+        w = tk.Toplevel(self.root)
+        w.title("Print HQ - Diagnóstico")
+        w.configure(bg=BG)
+        w.attributes("-topmost", True)
+        txt = tk.Text(w, width=100, height=28, bg=PANEL, fg=FG, insertbackground=FG, relief="flat",
+                      font=("Consolas", 9), wrap="word")
+        txt.pack(fill="both", expand=True, padx=px(10), pady=(px(10), 0))
+        txt.insert("1.0", text)
+        bar = tk.Frame(w, bg=BG)
+        bar.pack(fill="x", padx=px(10), pady=px(8))
+
+        def do_copy():
+            ok = copy_text(txt.get("1.0", "end").strip())
+            self.status.set("Relatório copiado." if ok else "Não consegui copiar: selecione o texto e use Ctrl+C.")
+        RoundBtn(bar, "Copiar tudo", command=do_copy, kind="accent", bg=BG, padx=16, pady=7).pack(side="left")
+        RoundBtn(bar, "Fechar", command=w.destroy, bg=BG, padx=16, pady=7).pack(side="left", padx=8)
+
+    def perf_test(self):
+        if self.rec.state != "idle" or self.job_running:
+            self.status.set("Pare a gravação e o replay antes de testar o desempenho.")
+            return
+        opts = self.make_opts()
+        if not opts or not self.disk_ok():
+            return
+        opts["mic"] = opts["spk"] = ""
+        opts["stage_pref"] = None
+        target = opts["fps"]
+        self.job_running = True
+        self.status.set("Teste de desempenho: ABRA O JOGO AGORA. Começa em 6 s e testa cada modo por 10 s.")
+
+        def work():
+            results, tmpd = [], APP_DIR / "tmp"
+            tmpd.mkdir(parents=True, exist_ok=True)
+            time.sleep(6)
+            for backend, gpu in Recorder(self)._stages(opts):
+                out = tmpd / "perf.mkv"
+                cmd = build_cmd(opts["ffmpeg"], opts, out, backend, False, gpu=gpu)
+                cmd = cmd[:-1] + ["-t", "10", str(out)]
+                try:
+                    r = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=NOWIN)
+                    ok, err = r.returncode == 0 and out.exists(), r.stderr.decode(errors="ignore")[-200:]
+                except Exception as ex:
+                    ok, err = False, str(ex)
+                if ok:
+                    n = count_frames(opts["ffmpeg"], out)
+                    results.append((backend, gpu, n / 10, int(out.stat().st_size * 8 / 10 / 1000), ""))
+                else:
+                    results.append((backend, gpu, 0, 0, err))
+                with contextlib.suppress(Exception):
+                    out.unlink()
+                if ok and results[-1][2] >= target * 0.9:
+                    break
+            self.ui_queue.put(lambda: self.perf_done(results, target))
+        threading.Thread(target=work, daemon=True).start()
+
+    def perf_done(self, results, target):
+        self.job_running = False
+        ok = [r for r in results if r[2] > 0]
+        lines = [f"• {STAGE_NAMES.get((b, g), b)}: " + (f"{fps:.0f} fps, ~{kb} kbps" if fps else "não funcionou")
+                 for b, g, fps, kb, _ in results]
+        if not ok:
+            self.status.set("O teste falhou em todos os modos. Veja Configurações > Geral > Diagnóstico.")
+            return
+        good = next((r for r in ok if r[2] >= target * 0.9), None)
+        pick = good or max(ok, key=lambda r: r[2])
+        self.cfg["stage_pref"] = [pick[0], pick[1]]
+        self.save_cfg()
+        msg = "Resultado do teste:\n" + "\n".join(lines) + f"\n\nVou usar: {STAGE_NAMES.get((pick[0], pick[1]))}."
+        self.status.set(f"Teste concluído: {pick[2]:.0f} fps com {STAGE_NAMES.get((pick[0], pick[1]))}.")
+        if not good and target > 30:
+            if messagebox.askyesno("Teste de desempenho", msg + f"\n\nNenhum modo chegou a {target} fps "
+                                   f"(melhor: {pick[2]:.0f}). Mudar para 30 fps?"):
+                self.rec_fps.set("30")
+        else:
+            messagebox.showinfo("Teste de desempenho", msg)
 
     def optimize(self, src, replace=False, height=0, force=False):
         """Recodifica com calma (prioridade baixa) para encolher o arquivo sem perda visível."""
@@ -3108,6 +3320,7 @@ class App:
             self.status.set(f"Não consegui otimizar: {err}")
             return
         self.progress.configure(value=100)
+        self.root.after(4000, lambda: self.progress.configure(value=0))
         pct = max(0, round((1 - after / before) * 100)) if before else 0
         msg = f"Otimizado: {fmt_size(before)} → {fmt_size(after)} (-{pct}%)" if after < before else \
             "O vídeo já estava bem compacto; mantive o original."
