@@ -1,5 +1,5 @@
 """
-Print HQ v4.4
+Print HQ v4.4.1
   Prints com editor embutido (setas, formas, texto, censura, marca-texto, numeração, OCR, fixar na tela)
   Gravação leve (FFmpeg) de monitor, janela ou área + replay dos últimos segundos
   Ferramentas: reduzir p/ Discord, cortar, GIF  |  Histórico  |  Ícone na bandeja  |  Atalhos editáveis
@@ -59,7 +59,7 @@ try:
 except Exception:
     winreg = None
 
-VERSION = "4.4.0"
+VERSION = "4.4.1"
 UPDATE_URL = "https://raw.githubusercontent.com/antonioexpedito020-code/print-hq/main/print_hq.pyw"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 CONFIG = Path.home() / ".print_hq.json"
@@ -506,7 +506,7 @@ BASE_CAP = [8000, 14000, 22000, 36000]  # kbps no limite, em 1080p a 60 fps (por
 
 def bitrate_cap(qi, w, h, fps):
     """Teto de bitrate: garante que o arquivo nunca explode, mesmo em cenas muito rápidas."""
-    k = BASE_CAP[qi] * (w * h * fps) / (1920 * 1080 * 60)
+    k = BASE_CAP[qi] * (w * h / (1920 * 1080)) * (fps / 60) ** 0.6
     return int(min(80000, max(1500, k)))
 
 
@@ -536,8 +536,8 @@ def enc_args(enc, qi, fps, cap=None, rich=True):
         return a
     if enc == "h264_amf":
         if rich:  # bitrate-alvo com pico: bem mais eficiente que CQP nesse codificador
-            return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "vbr_peak", "-b:v", f"{int(cap * 0.7)}k",
-                    "-maxrate", f"{cap}k", "-g", g]
+            return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "vbr_peak", "-b:v", f"{cap}k",
+                    "-maxrate", f"{int(cap * 1.5)}k", "-g", g]
         return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q + 2), "-g", g]
     if enc == "h264_qsv":
         return ["-c:v", "h264_qsv", "-preset", "medium" if rich else "veryfast", "-global_quality", str(q), "-g", g]
@@ -1935,7 +1935,7 @@ class App:
         self.rec_res = V("res", "1080p")
         self.rec_fps = V("fps", "60")
         self.rec_quality = V("quality", QUALITY[1])
-        if cfg.get("v") != 4:  # versões antigas gravavam em "Leve": sobe para "Equilibrada"
+        if cfg.get("v", 0) < 4:  # só migra configurações muito antigas (gravavam em "Leve")
             self.rec_quality.set(QUALITY[1])
         self.rec_mic = V("mic", "Nenhum")
         self.rec_sys = V("sys", "")
