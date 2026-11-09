@@ -1,0 +1,38 @@
+PRINT HQ 1.2.0 — Windows 11
+================================
+
+INSTALAR ESTA VERSÃO (UMA VEZ)
+1. Extraia o ZIP em uma pasta permanente, por exemplo Documentos\PrintHQ.
+   Não execute diretamente de dentro do ZIP.
+2. Dentro da pasta, clique na barra de endereço, digite powershell e pressione Enter.
+3. Execute: py -m pip install -r requirements.txt
+4. Depois, dê dois cliques em print_hq.pyw para abrir.
+   (Se necessário: py print_hq.pyw.)
+5. FFmpeg deve estar instalado no PATH (ffmpeg -version).
+
+ATUALIZAÇÕES FUTURAS
+- Clique em "Verificar atualizações" ou aguarde a verificação automática.
+- Para o atualizador encontrar versões, o proprietário do repositório GitHub
+  antonioexpedito020-code/print-hq precisa publicar um GitHub Release com tag
+  vX.Y.Z e dois assets:
+    PrintHQ_X.Y.Z.zip
+    PrintHQ_X.Y.Z.sha256
+- O ZIP deve conter os arquivos da aplicação (app_core.py, editor.py,
+  updater.py, update_worker.py, requirements.txt, print_hq.pyw).
+- O SHA256 deve ser o hash SHA-256 do ZIP, em formato de texto hexadecimal.
+- Se ainda não houver Releases, o aplicativo informa que está atualizado.
+- As atualizações são verificadas e baixadas automaticamente, mas a instalação
+  só começa após confirmação. Arquivos antigos são guardados em .update_backup.
+- A primeira instalação desta versão é manual; o atualizador é para as próximas.
+
+RECURSOS
+- Print de tela, seleção de região, editor com desenhos e texto.
+- Copiar imagem editada, salvar, histórico das 200 capturas mais recentes.
+- Gravação MP4 H.264 com FFmpeg, 30/60 FPS, perfil Discord compacto.
+- Verificação de atualizações pelo GitHub.
+
+LIMITAÇÕES
+- Ainda sem áudio do sistema e sem microfone.
+- Não garante limite de upload do Discord: depende da conta/servidor.
+- AMD AMF depende de driver/FFmpeg e pode falhar; tente x264.
+- Teste real em Windows é necessário; sintaxe foi validada fora do Windows.
