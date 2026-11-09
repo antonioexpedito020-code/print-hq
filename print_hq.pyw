@@ -1,5 +1,5 @@
 """
-Print HQ v4.4.1
+Print HQ v4.5.0
   Prints com editor embutido (setas, formas, texto, censura, marca-texto, numeração, OCR, fixar na tela)
   Gravação leve (FFmpeg) de monitor, janela ou área + replay dos últimos segundos
   Ferramentas: reduzir p/ Discord, cortar, GIF  |  Histórico  |  Ícone na bandeja  |  Atalhos editáveis
@@ -59,7 +59,7 @@ try:
 except Exception:
     winreg = None
 
-VERSION = "4.4.1"
+VERSION = "4.5.0"
 UPDATE_URL = "https://raw.githubusercontent.com/antonioexpedito020-code/print-hq/main/print_hq.pyw"
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 CONFIG = Path.home() / ".print_hq.json"
@@ -237,11 +237,12 @@ def save_image(img, folder, fmt):
 
 
 def open_path(p):
-    try:
-        open_path(p)
-    except Exception:
-        with contextlib.suppress(Exception):
-            subprocess.Popen(["xdg-open", str(p)])
+    """Abre arquivos e pastas no aplicativo padrão do sistema, sem recursão."""
+    path = str(p)
+    if sys.platform == "win32":
+        os.startfile(path)
+    else:
+        subprocess.Popen(["xdg-open", path])
 
 
 def _open_clipboard():
@@ -527,6 +528,10 @@ def enc_args(enc, qi, fps, cap=None, rich=True):
     # quadro completo (keyframe) só a cada ~8 s: em tela parada isso economiza muito. O replay força os seus próprios.
     q, g = QV[enc][qi], str(fps * 8)
     cap = cap or 20000
+    # O AMF integrado precisa de mais bits em cenas movimentadas (ex.: Roblox).
+    # Mantém os perfis Leve e as demais GPUs sem alterações.
+    if enc == "h264_amf" and rich and qi >= 1:
+        cap = max(cap, int([0, 14000, 20000, 28000][qi] * (fps / 30) ** 0.55))
     rate = ["-maxrate", f"{cap}k", "-bufsize", f"{cap * 2}k"]
     if enc == "h264_nvenc":
         a = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(q), "-b:v", "0",
@@ -998,7 +1003,8 @@ def gif_cmd(ff, src, out, start, span, width, fps):
 
 
 def optimize_cmd(ff, src, out, qi, height=0):
-    crf = [31, 27, 24, 20][qi]  # um pouco acima do da gravação: aqui o objetivo é encolher
+    # Segunda compressão: CRF conservador para preservar detalhes da gravação.
+    crf = [29, 23, 20, 18][qi]
     cmd = [ff, "-y", "-i", str(src)]
     if height:  # reduz a resolução com calma (alta qualidade), já que o jogo não está mais rodando
         cmd += ["-vf", f"scale=-2:trunc(min(ih\\,{height})/2)*2:flags=lanczos"]
@@ -1947,7 +1953,7 @@ class App:
         self.enc_mode = V("enc_mode", ENC_MODES[0])
         if cfg.get("v") != 6 or self.enc_mode.get() not in ENC_MODES:
             self.enc_mode.set(ENC_MODES[0])  # versões anteriores escolhiam o processador e travavam o jogo
-        self.auto_opt = tk.BooleanVar(value=cfg.get("auto_opt", True) if cfg.get("v") == 6 else True)
+        self.auto_opt = tk.BooleanVar(value=cfg.get("auto_opt", False))
         self.post_height = 0
         self.est_var = tk.StringVar(value="")
         self.hw, self.hw_ready, self._hk_last = {"encoder": "libx264", "rich": True, "gpu": False}, False, {}
@@ -2348,7 +2354,7 @@ class App:
         self.form_row(c, 4, "Modo de captura", self.cmb(c, self.cap_mode, CAP_MODES, width=34))
         ro = tk.Frame(c, bg=PANEL)
         Switch(ro, self.auto_opt, bg=PANEL).pack(side="left")
-        self.lbl(ro, "Otimizar depois de gravar (arquivo bem menor)", muted=False).pack(side="left", padx=px(8))
+        self.lbl(ro, "Otimizar depois de gravar (pode reduzir a qualidade)", muted=False).pack(side="left", padx=px(8))
         ro.grid(row=5, column=0, columnspan=2, sticky="w", pady=px(5))
         tk.Label(c, textvariable=self.est_var, bg=PANEL, fg=ACCENT, font=("Segoe UI", 9), anchor="w",
                  wraplength=px(480), justify="left").grid(row=6, column=0, columnspan=2, sticky="w", pady=(px(4), 0))
